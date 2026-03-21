@@ -41,7 +41,7 @@ pip install numpy pandas scipy matplotlib requests MetaTrader5
 
 | File | Purpose |
 |---|---|
-| `GammaExposureLevels.py` | Main analysis & entry point (`analyze_options` + `main`) |
+| `main.py` | Main analysis & entry point (`analyze_options` + `main`) |
 | `bs_greeks.py` | Black-Scholes pricing, Greeks, implied vol |
 | `gex_utils.py` | Gamma flip detection |
 | `gex_plots.py` | All matplotlib charts (notional, Friday GEX, all-expiry GEX) |
