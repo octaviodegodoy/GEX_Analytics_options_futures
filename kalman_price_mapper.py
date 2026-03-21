@@ -126,15 +126,34 @@ class KalmanPriceMapper:
     def beta(self) -> float:
         return self.state[1]
 
-    def bova11_to_ind(self, bova11_price: float) -> float:
-        """Convert a BOVA11 price to the corresponding $IND price."""
-        return self.alpha + self.beta * bova11_price
 
-    def ind_to_bova11(self, ind_price: float) -> float:
-        """Convert an $IND price to the corresponding BOVA11 price."""
+    def bova11_to_ind(self, bova11_price: float, log_input: bool = False) -> float:
+        """Convert a BOVA11 price to the corresponding $IND price.
+        If the Kalman filter was fit on log prices, exponentiate the result to get the actual price.
+        Set log_input=True if passing a log price, otherwise pass the actual price.
+        """
+        if log_input:
+            ind_log = self.alpha + self.beta * bova11_price
+            return np.exp(ind_log)
+        else:
+            # If input is price, convert to log, apply, then exponentiate
+            ind_log = self.alpha + self.beta * np.log(bova11_price)
+            return np.exp(ind_log)
+
+    def ind_to_bova11(self, ind_price: float, log_input: bool = False) -> float:
+        """Convert an $IND price to the corresponding BOVA11 price.
+        If the Kalman filter was fit on log prices, exponentiate the result to get the actual price.
+        Set log_input=True if passing a log price, otherwise pass the actual price.
+        """
         if self.beta == 0:
             raise ValueError("beta is zero — filter not fitted yet")
-        return (ind_price - self.alpha) / self.beta
+        if log_input:
+            bova11_log = (ind_price - self.alpha) / self.beta
+            return np.exp(bova11_log)
+        else:
+            # If input is price, convert to log, apply, then exponentiate
+            bova11_log = (np.log(ind_price) - self.alpha) / self.beta
+            return np.exp(bova11_log)
 
     def convert_strikes(self, strikes: np.ndarray) -> np.ndarray:
         """Convert an array of BOVA11 option strikes to $IND equivalents."""
@@ -188,30 +207,42 @@ def build_ind_bova11_mapper(mt5_conn,
     df_bova = df_bova.set_index('time')[['close']].rename(columns={'close': 'bova11'})
     merged = df_ind.join(df_bova, how='inner').dropna()
 
-    if len(merged) < 30:
+    if len(merged) < 31:
         raise RuntimeError(
-            f"Only {len(merged)} overlapping bars — need at least 30 for a "
-            "reliable calibration."
+            f"Only {len(merged)} overlapping bars — need at least 31 for a "
+            "reliable calibration (log returns require at least 31)."
         )
 
-    # Estimate sensible initial beta from OLS on last 60 bars
+    # Calculate log prices
+    merged['ind_log'] = np.log(merged['ind'])
+    merged['bova11_log'] = np.log(merged['bova11'])
+    merged = merged.dropna(subset=['ind_log', 'bova11_log'])
+
+    # Estimate sensible initial beta from OLS on last 60 log prices
     lookback = min(60, len(merged))
-    ols_beta = np.polyfit(merged['bova11'].values[-lookback:],
-                          merged['ind'].values[-lookback:], 1)[0]
+    # OLS: y = alpha + beta * x, so x = bova11_log, y = ind_log
+    ols_coeffs = np.polyfit(
+        merged['bova11_log'].values[-lookback:],
+        merged['ind_log'].values[-lookback:], 1
+    )
+    ols_beta = ols_coeffs[0]
 
     mapper = KalmanPriceMapper(
         delta=delta,
         observation_noise=observation_noise,
         initial_beta=ols_beta,
     )
-    results = mapper.fit(merged['ind'].values, merged['bova11'].values)
+    results = mapper.fit(
+        merged['ind_log'].values,
+        merged['bova11_log'].values
+    )
 
-    print(f"[KalmanPriceMapper] Fitted on {len(merged)} daily bars")
-    print(f"  Latest α = {mapper.alpha:,.2f}  β = {mapper.beta:,.4f}")
-    print(f"  Residual std = {results['residual'].std():,.2f} pts")
-    print(f"  Example: BOVA11 {merged['bova11'].iloc[-1]:.2f} → "
-          f"$IND {mapper.bova11_to_ind(merged['bova11'].iloc[-1]):,.0f} "
-          f"(actual {merged['ind'].iloc[-1]:,.0f})")
+    print(f"[KalmanPriceMapper] Fitted on {len(merged)} daily log prices")
+    print(f"  Latest α = {mapper.alpha:,.6f}  β = {mapper.beta:,.6f}")
+    print(f"  Residual std = {results['residual'].std():,.6f} (log price units)")
+    print(f"  Example: BOVA11 log {merged['bova11_log'].iloc[-1]:.6f} → "
+          f"$IND log {mapper.bova11_to_ind(merged['bova11_log'].iloc[-1]):,.6f} "
+          f"(actual {merged['ind_log'].iloc[-1]:,.6f})")
 
     return mapper
 
