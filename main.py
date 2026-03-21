@@ -267,24 +267,24 @@ async def analyze_options(spot: float, underlying: str = "PETR4", ind_mapper: Ka
            side = "above" if diff > 0 else "below"
            print(f"Spot is {abs(pct):.2f}% {side} the flip.")
            if diff > 0:
-               print("→ Dealers short gamma: market mechanically amplified.")
-           else:
                print("→ Dealers long gamma: market mechanically dampened.")
-   
-       # Market regime classification
+           else:
+               print("→ Dealers short gamma: market mechanically amplified.")
+
+       # Market regime classification (positive gamma: spot > gamma_flip)
        if np.isfinite(gamma_flip):
            if spot >= gamma_flip * 1.05:
-               regime = "HIGH VOLATILITY"
-               rationale = "Dealers short gamma, hedging exacerbates moves."
-               strategy = "Long gamma, directional or convexity-driven setups."
+               regime = "POSITIVE GAMMA (Low Volatility)"
+               rationale = "Dealers long gamma, hedging dampens volatility (mean-reverting)."
+               strategy = "Range trading, mean-reversion, sell call wall, buy put wall."
            elif spot <= gamma_flip * 0.95:
-               regime = "LOW VOLATILITY"
-               rationale = "Dealers long gamma, hedging absorbs shocks."
-               strategy = "Range trading, vol selling, short gamma spreads."
+               regime = "NEGATIVE GAMMA (High Volatility)"
+               rationale = "Dealers short gamma, hedging amplifies volatility (trending)."
+               strategy = "Trend following, breakout trades, buy above gamma flip."
            else:
                regime = "TRANSITION ZONE"
                rationale = "Market near flip — unstable hedging behavior."
-               strategy = "Neutral, calendar, or butterfly setups."
+               strategy = "Reduce size, use 5-min confirmation, neutral setups."
        else:
            regime, rationale, strategy = "UNKNOWN", "Gamma Flip not found", "N/A"
    

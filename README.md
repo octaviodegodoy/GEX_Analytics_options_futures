@@ -80,13 +80,24 @@ pip install numpy pandas scipy matplotlib requests MetaTrader5
 
 ### Gamma regime quick reference
 
-| Regime | Condition | Dealer behavior | Strategy |
-|---|---|---|---|
-| Positive gamma | Spot below gamma flip | Dealers dampen moves | Mean-reversion at walls (buy put wall, sell call wall) |
-| Negative gamma | Spot above gamma flip | Dealers amplify moves | Buy above gamma flip (trend continuation on wall breaks) |
-| Transition zone | Spot within ±0.5% of flip | Unstable | Reduce size, use 5-min confirmation |
+**Spot Price Relative to Gamma Flip for Positive Gamma:**
+
+The spot price must be above the gamma flip level for the market to be in a positive gamma (positive GEX) regime.
+
+- **When spot > gamma flip:** Market makers are net long gamma.
+	- Their hedging behavior is counter-cyclical (buying dips, selling rallies), which dampens volatility and promotes range-bound, mean-reverting price action.
+- **When spot < gamma flip:** Market makers are net short gamma.
+	- Hedging becomes pro-cyclical (buying rallies, selling crashes), amplifying volatility and enabling trending moves.
+
+**Key Insight:** The gamma flip (or zero gamma level) is the threshold where dealer hedging transitions from stabilizing to destabilizing. Traders monitor whether price is above or below this level to determine the prevailing volatility regime.
+
+| Regime         | Condition                | Dealer behavior         | Strategy                                                      |
+|---------------|--------------------------|-------------------------|---------------------------------------------------------------|
+| Positive gamma| Spot above gamma flip    | Dealers dampen moves    | Mean-reversion at walls (buy put wall, sell call wall)         |
+| Negative gamma| Spot below gamma flip    | Dealers amplify moves   | Sell below gamma flip (trend continuation on wall breaks)      |
+| Transition zone| Spot within ±0.5% of flip| Unstable                | Reduce size, use 5-min confirmation                            |
 
 **Key levels:**
-- **Gamma flip:** Buy above gamma flip (bullish regime), sell below (mean-reversion regime).
+- **Gamma flip:** Buy above gamma flip (bullish regime), sell below (trend regime).
 - **Call wall:** Sell/short at call wall (resistance).
 - **Put wall:** Buy/long at put wall (support).
