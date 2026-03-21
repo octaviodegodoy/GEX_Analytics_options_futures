@@ -11,6 +11,32 @@ BOVA11 — B3 Brazilian options via COTAHIST + OI proxy
 - Call/Put walls and Gamma Flip
 - $IND ↔ BOVA11 Kalman regression & delta-neutral hedge sizing
 
+## Requirements
+
+**Python 3.10** (64-bit) — required by MetaTrader 5. The MT5 Python integration only supports the **64-bit** build. Install it from [python.org](https://www.python.org/downloads/release/python-3100/) and make sure "Add Python to PATH" is checked.
+
+### Dependencies
+
+```
+pip install numpy pandas scipy matplotlib requests MetaTrader5
+```
+
+| Package | Purpose |
+|---|---|
+| `numpy` | Array operations, Greeks computation |
+| `pandas` | DataFrames for option chains and COTAHIST data |
+| `scipy` | Black-Scholes pricing (stats, optimize) |
+| `matplotlib` | GEX and notional charts |
+| `requests` | Downloading B3 COTAHIST files |
+| `MetaTrader5` | Live market data and order execution via MT5 terminal |
+
+### MetaTrader 5 setup
+
+1. Install MetaTrader 5 and log in to a broker account.
+2. In MT5, go to **Tools → Options → Expert Advisors** and enable **Allow Algo Trading**.
+3. Place this project folder under your MT5 `Scripts` directory (e.g. `MQL5/Scripts/GEX_Analytics_options_futures`).
+4. Run from a terminal or from within MT5's integrated Python environment.
+
 ## Project structure
 
 | File | Purpose |
