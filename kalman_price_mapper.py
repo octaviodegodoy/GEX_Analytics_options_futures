@@ -382,3 +382,41 @@ def calculate_delta_neutral_hedge(mapper: KalmanPriceMapper,
         'ind_spot': mapper.bova11_to_ind(spot),
         'ind_strike': mapper.bova11_to_ind(best['Strike']),
     }
+
+
+# ============================================================
+# Kalman Parameter Grid Search Utility
+# ============================================================
+def kalman_grid_search(ind_prices, bova11_prices, 
+                      delta_grid=None, obs_noise_grid=None, 
+                      initial_alpha=0.0, initial_beta=None, initial_variance=1e4):
+    """
+    Grid search for best Kalman filter noise parameters on given price series.
+    Returns a DataFrame with parameter combinations and their residual std.
+    """
+    if delta_grid is None:
+        delta_grid = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2]
+    if obs_noise_grid is None:
+        obs_noise_grid = [10, 50, 100, 250, 500, 1000]
+    if initial_beta is None:
+        # OLS estimate for initial beta
+        initial_beta = np.polyfit(bova11_prices, ind_prices, 1)[0]
+
+    results = []
+    for delta in delta_grid:
+        for obs_noise in obs_noise_grid:
+            kf = KalmanPriceMapper(
+                delta=delta,
+                observation_noise=obs_noise,
+                initial_alpha=initial_alpha,
+                initial_beta=initial_beta,
+                initial_variance=initial_variance,
+            )
+            df = kf.fit(ind_prices, bova11_prices)
+            resid_std = df['residual'].std()
+            results.append({
+                'delta': delta,
+                'observation_noise': obs_noise,
+                'residual_std': resid_std,
+            })
+    return pd.DataFrame(results).sort_values('residual_std')
