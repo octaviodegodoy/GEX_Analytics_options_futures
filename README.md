@@ -1,4 +1,4 @@
-# Options GEX Analytics — Outspoken Market
+# Options GEX Analytics
 
 BOVA11 — B3 Brazilian options via COTAHIST + OI proxy
 

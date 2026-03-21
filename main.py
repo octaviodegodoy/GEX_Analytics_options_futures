@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Options GEX Analytics — Outspoken Market version
--------------------------------------------------
+Options GEX Analytics
+---------------------
 BOVA11 — B3 Brazilian options via COTAHIST + OI proxy
 
 Performs:
