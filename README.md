@@ -82,6 +82,11 @@ pip install numpy pandas scipy matplotlib requests MetaTrader5
 
 | Regime | Condition | Dealer behavior | Strategy |
 |---|---|---|---|
-| Positive gamma | Spot below gamma flip | Dealers dampen moves | Mean-reversion at walls |
-| Negative gamma | Spot above gamma flip | Dealers amplify moves | Trend continuation on wall breaks |
+| Positive gamma | Spot below gamma flip | Dealers dampen moves | Mean-reversion at walls (buy put wall, sell call wall) |
+| Negative gamma | Spot above gamma flip | Dealers amplify moves | Buy above gamma flip (trend continuation on wall breaks) |
 | Transition zone | Spot within ±0.5% of flip | Unstable | Reduce size, use 5-min confirmation |
+
+**Key levels:**
+- **Gamma flip:** Buy above gamma flip (bullish regime), sell below (mean-reversion regime).
+- **Call wall:** Sell/short at call wall (resistance).
+- **Put wall:** Buy/long at put wall (support).
