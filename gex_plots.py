@@ -10,6 +10,9 @@ import matplotlib.ticker as mticker
 
 def plot_notional_by_strike(vol_by_strike, spot, underlying, show_plots=False):
     """Stacked bar chart of notional volume by strike."""
+    if vol_by_strike.empty or vol_by_strike.select_dtypes(include='number').empty:
+        print(f"[!] No notional data to plot for {underlying} — skipping chart.")
+        return
     vol_by_strike.plot(kind='bar', stacked=True, figsize=(12, 12),
                        color=['#2563EB', '#EF4444'], alpha=0.7)
     plt.axvline(np.argmin(np.abs(vol_by_strike.index - spot)),

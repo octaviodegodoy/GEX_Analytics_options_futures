@@ -360,10 +360,16 @@ async def main():
     for asset in ASSET_SYMBOL:
         print(f"\n{'#'*80}\nAnalyzing {asset}...\n{'#'*80}")
         symbol_info = mt5_conn.get_symbol_info(asset)
+        if symbol_info is None:
+            print(f"[X] Could not get symbol info for {asset} — skipping.")
+            continue
         spot_price = (symbol_info.bid + symbol_info.ask) / 2
+        if spot_price <= 0:
+            print(f"[X] Spot price for {asset} is {spot_price:.2f} (bid={symbol_info.bid}, ask={symbol_info.ask}) — skipping.")
+            continue
         print(f"Analyzing options data for {asset} with spot price {spot_price:.2f}...")
         # Pass ind_mapper only when analyzing BOVA11
         mapper_for_asset = ind_mapper if asset == "BOVA11" else None
-        await analyze_options(spot_price, asset, ind_mapper=mapper_for_asset, show_plots=False)
+        await analyze_options(spot_price, asset, ind_mapper=mapper_for_asset, show_plots=True)
 
 asyncio.run(main())
