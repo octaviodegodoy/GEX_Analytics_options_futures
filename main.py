@@ -301,13 +301,13 @@ async def analyze_options(spot: float, underlying: str = "PETR4", ind_mapper: Ka
        resist = gex_sorted.head(4)
        supports = gex_sorted.tail(4)
    
-       print("Support Zones (dealers long gamma → cushion):")
+       print("Support Zones (dealers short gamma on puts → hedge-buying cushion):")
        for _, r in supports.iterrows():
            gex_mil = r["GEX_customer"] / 1e6
            strength = "Strong" if abs(gex_mil) > 200 else "Moderate" if abs(gex_mil) > 100 else "Weak"
            print(f"  Strike {r['Strike']:>8.2f} | {gex_mil:>7.2f}M | {strength}")
    
-       print("\nResistance Zones (dealers short gamma → acceleration risk):")
+       print("\nResistance Zones (dealers long gamma → counter-trend selling caps rallies):")
        for _, r in resist.iterrows():
            gex_mil = r["GEX_customer"] / 1e6
            strength = "Strong" if abs(gex_mil) > 200 else "Moderate" if abs(gex_mil) > 100 else "Weak"
