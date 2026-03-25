@@ -1,5 +1,6 @@
 PERIODS = 60
-SHIFT_PERIODS = 0 
+SHIFT_PERIODS = 0
+USE_KALMAN = False  # True = Kalman filter, False = OLS linear regression
 MAGIC_NUMBER = 345346
 CALL_OPTION = 0
 UNIX_DAYS_IN_SECONDS = 60*60*24

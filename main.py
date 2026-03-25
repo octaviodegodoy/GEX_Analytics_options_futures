@@ -44,14 +44,16 @@ PARENT_DIR = os.path.dirname(SCRIPT_DIR)
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
-from constants import ASSET_SYMBOL
+from constants import ASSET_SYMBOL, USE_KALMAN
 from gex_utils import find_gamma_flip
 from gex_plots import plot_notional_by_strike, plot_gex_friday, plot_gex_all_expiry
 from b3_options_loader import load_b3_options_data
 
 from kalman_price_mapper import (
     KalmanPriceMapper,
+    OLSPriceMapper,
     build_ind_bova11_mapper,
+    build_ind_bova11_ols_mapper,
     calculate_delta_neutral_hedge,
 )
 
@@ -318,12 +320,26 @@ async def analyze_options(spot: float, underlying: str = "PETR4", ind_mapper: Ka
            ind_call_wall  = ind_mapper.bova11_to_ind(call_wall)
            ind_put_wall   = ind_mapper.bova11_to_ind(put_wall)
            ind_gamma_flip = ind_mapper.bova11_to_ind(gamma_flip)
-           print(f"{'':>15} {'BOVA11':>12} {'$IND':>14}")
-           print(f"  {'Spot':<13} {spot:>12,.2f} {ind_spot:>14,.0f}")
+
+           # Fetch live $IND price for comparison with regression estimate
+           model_label = "Kalman" if USE_KALMAN else "OLS"
+           _mt5 = MT5Connector()
+           ind_live_info = _mt5.get_symbol_info("WIN$N")
+           if ind_live_info is not None and (ind_live_info.bid + ind_live_info.ask) > 0:
+               ind_live = (ind_live_info.bid + ind_live_info.ask) / 2
+               ind_diff = ind_spot - ind_live
+               ind_diff_pct = ind_diff / ind_live * 100
+               print(f"{'':>15} {'BOVA11':>12} {f'$IND {model_label}':>14} {'$IND Live':>14} {'Diff':>10}")
+               print(f"  {'Spot':<13} {spot:>12,.2f} {ind_spot:>14,.0f} {ind_live:>14,.0f} {ind_diff_pct:>+9.2f}%")
+           else:
+               ind_live = None
+               print(f"{'':>15} {'BOVA11':>12} {f'$IND {model_label}':>14}")
+               print(f"  {'Spot':<13} {spot:>12,.2f} {ind_spot:>14,.0f}")
+
            print(f"  {'Call Wall':<13} {call_wall:>12,.2f} {ind_call_wall:>14,.0f}")
            print(f"  {'Put Wall':<13} {put_wall:>12,.2f} {ind_put_wall:>14,.0f}")
            print(f"  {'Gamma Flip':<13} {gamma_flip:>12,.2f} {ind_gamma_flip:>14,.0f}")
-           print(f"  Kalman β = {ind_mapper.beta:,.4f}  α = {ind_mapper.alpha:,.2f}")
+           print(f"  {model_label} β = {ind_mapper.beta:,.4f}  α = {ind_mapper.alpha:,.2f}")
 
            # Delta-neutral hedge estimate
            print(f"\n  Delta-Neutral Hedge (1 WIN long → buy BOVA11 puts):")
@@ -350,9 +366,12 @@ async def analyze_options(spot: float, underlying: str = "PETR4", ind_mapper: Ka
 async def main():
     mt5_conn = MT5Connector()
 
-    # Build Kalman mapper: BOVA11 ↔ $IND
+    # Build price mapper: BOVA11 ↔ $IND
     try:
-        ind_mapper = build_ind_bova11_mapper(mt5_conn)
+        if USE_KALMAN:
+            ind_mapper = build_ind_bova11_mapper(mt5_conn)
+        else:
+            ind_mapper = build_ind_bova11_ols_mapper(mt5_conn)
     except Exception as e:
         print(f"[!] Could not build IND↔BOVA11 mapper: {e}")
         ind_mapper = None

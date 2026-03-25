@@ -161,6 +161,70 @@ class KalmanPriceMapper:
 
 
 # ============================================================
+# OLS Price Mapper — simple linear regression on log prices
+# ============================================================
+class OLSPriceMapper:
+    """
+    Ordinary Least Squares regression on log prices:
+        log(IND) = alpha + beta * log(BOVA11)
+
+    Same interface as KalmanPriceMapper (alpha, beta, bova11_to_ind,
+    ind_to_bova11) so they can be used interchangeably.
+    """
+
+    def __init__(self):
+        self._alpha = 0.0
+        self._beta = 0.0
+        self.r_squared = 0.0
+        self.residual_std = 0.0
+
+    def fit(self, ind_log_prices: np.ndarray, bova11_log_prices: np.ndarray) -> pd.DataFrame:
+        """Fit OLS: log(IND) = alpha + beta * log(BOVA11)."""
+        coeffs = np.polyfit(bova11_log_prices, ind_log_prices, 1)
+        self._beta = coeffs[0]
+        self._alpha = coeffs[1]
+
+        estimated = self._alpha + self._beta * bova11_log_prices
+        residuals = ind_log_prices - estimated
+        ss_res = np.sum(residuals ** 2)
+        ss_tot = np.sum((ind_log_prices - np.mean(ind_log_prices)) ** 2)
+        self.r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        self.residual_std = np.std(residuals)
+
+        return pd.DataFrame({
+            'ind': ind_log_prices,
+            'bova11': bova11_log_prices,
+            'alpha': self._alpha,
+            'beta': self._beta,
+            'ind_estimated': estimated,
+            'residual': residuals,
+        })
+
+    @property
+    def alpha(self) -> float:
+        return self._alpha
+
+    @property
+    def beta(self) -> float:
+        return self._beta
+
+    def bova11_to_ind(self, bova11_price: float, log_input: bool = False) -> float:
+        if log_input:
+            return np.exp(self._alpha + self._beta * bova11_price)
+        return np.exp(self._alpha + self._beta * np.log(bova11_price))
+
+    def ind_to_bova11(self, ind_price: float, log_input: bool = False) -> float:
+        if self._beta == 0:
+            raise ValueError("beta is zero — model not fitted yet")
+        if log_input:
+            return np.exp((ind_price - self._alpha) / self._beta)
+        return np.exp((np.log(ind_price) - self._alpha) / self._beta)
+
+    def convert_strikes(self, strikes: np.ndarray) -> np.ndarray:
+        return self._alpha + self._beta * np.asarray(strikes, dtype=np.float64)
+
+
+# ============================================================
 # Builder — fetch from MT5 and fit
 # ============================================================
 def build_ind_bova11_mapper(mt5_conn,
@@ -240,6 +304,47 @@ def build_ind_bova11_mapper(mt5_conn,
     print(f"[KalmanPriceMapper] Fitted on {len(merged)} daily log prices")
     print(f"  Latest α = {mapper.alpha:,.6f}  β = {mapper.beta:,.6f}")
     print(f"  Residual std = {results['residual'].std():,.6f} (log price units)")
+    print(f"  Example: BOVA11 log {merged['bova11_log'].iloc[-1]:.6f} → "
+          f"$IND log {mapper.bova11_to_ind(merged['bova11_log'].iloc[-1]):,.6f} "
+          f"(actual {merged['ind_log'].iloc[-1]:,.6f})")
+
+    return mapper
+
+
+def build_ind_bova11_ols_mapper(mt5_conn,
+                                ind_symbol: str = "WIN$N",
+                                bova11_symbol: str = "BOVA11",
+                                periods: int = PERIODS) -> OLSPriceMapper:
+    """
+    Fetch historical daily close prices from MT5 for $IND and BOVA11,
+    fit an OLS regression on log prices, and return an OLSPriceMapper.
+    """
+    df_ind = mt5_conn.get_data(ind_symbol, mt5_conn.TIMEFRAME_D1, periods, SHIFT_PERIODS)
+    df_bova = mt5_conn.get_data(bova11_symbol, mt5_conn.TIMEFRAME_D1, periods, SHIFT_PERIODS)
+
+    if df_ind is None or df_bova is None:
+        raise RuntimeError(
+            f"Could not fetch data for {ind_symbol} and/or {bova11_symbol}. "
+            "Make sure both symbols are available in MT5 Market Watch."
+        )
+
+    df_ind = df_ind.set_index('time')[['close']].rename(columns={'close': 'ind'})
+    df_bova = df_bova.set_index('time')[['close']].rename(columns={'close': 'bova11'})
+    merged = df_ind.join(df_bova, how='inner').dropna()
+
+    if len(merged) < 10:
+        raise RuntimeError(f"Only {len(merged)} overlapping bars — need at least 10.")
+
+    merged['ind_log'] = np.log(merged['ind'])
+    merged['bova11_log'] = np.log(merged['bova11'])
+    merged = merged.dropna(subset=['ind_log', 'bova11_log'])
+
+    mapper = OLSPriceMapper()
+    results = mapper.fit(merged['ind_log'].values, merged['bova11_log'].values)
+
+    print(f"[OLSPriceMapper] Fitted on {len(merged)} daily log prices")
+    print(f"  α = {mapper.alpha:,.6f}  β = {mapper.beta:,.6f}  R² = {mapper.r_squared:.6f}")
+    print(f"  Residual std = {mapper.residual_std:,.6f} (log price units)")
     print(f"  Example: BOVA11 log {merged['bova11_log'].iloc[-1]:.6f} → "
           f"$IND log {mapper.bova11_to_ind(merged['bova11_log'].iloc[-1]):,.6f} "
           f"(actual {merged['ind_log'].iloc[-1]:,.6f})")
