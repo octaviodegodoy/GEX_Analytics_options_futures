@@ -8,7 +8,6 @@ import numpy as np
 from scipy.stats import norm
 from scipy.optimize import brentq
 
-RISK_FREE_RATE = 0.1425       # Brazilian SELIC
 CONTRACT_MULTIPLIER = 1       # B3 mini options = 1 share
 
 
@@ -30,6 +29,21 @@ def bs_gamma(S, K, T, r, sigma):
         return 0.0
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     return norm.pdf(d1) / (S * sigma * np.sqrt(T))
+
+
+def fx_gamma(S, K, T, r, sigma):
+    """FX-style Gamma using forward pricing (dollar gamma).
+
+    Equivalent to bs_gamma × S.  Uses the forward price F = S·e^(rT)
+    and discount factor so the result is already in dollar terms per
+    contract.  When computing GEX multiply by spot (not spot²).
+    """
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    disc = np.exp(-r * T)
+    F = S / disc                    # forward price
+    d1 = (np.log(F / K) + 0.5 * sigma**2 * T) / (sigma * np.sqrt(T))
+    return norm.pdf(d1) * disc * F / (S * sigma * np.sqrt(T))
 
 
 def bs_delta(S, K, T, r, sigma, option_type='call'):

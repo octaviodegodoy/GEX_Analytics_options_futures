@@ -10,10 +10,8 @@ Performs:
 - Notional by strike (volume financeiro)
 - Gamma Exposure (Customer/Dealer)
 - Call/Put walls and Gamma Flip
-- $IND ↔ BOVA11 Kalman regression & delta-neutral hedge sizing
-
-Practical Usage — Intraday $IND Trading
-----------------------------------------
+Practical Usage — Intraday Trading
+-----------------------------------
 Best days to run:
   Mon/Tue → most reliable GEX levels (full gamma profile after Friday expiry).
   Wed     → mid-week check; levels still hold well.
@@ -25,7 +23,7 @@ Recommended intraday timeframe: 15-minute bars.
   - Drop to 5-min if spot is within ±0.5% of gamma flip (transition zone).
 
 Session workflow:
-  1. Pre-market (09:00 BRT): run script → note $IND call wall, put wall, gamma flip.
+  1. Pre-market (09:00 BRT): run script → note call wall, put wall, gamma flip.
   2. 10:00–11:30: first 6 bars — price discovery vs GEX levels.
   3. Wall touch on 15-min close → mean-reversion entry (positive gamma regime).
   4. Wall break on 15-min close → trend continuation (negative gamma regime).
@@ -36,7 +34,6 @@ import pandas as pd
 import os
 import sys
 import asyncio
-from datetime import datetime, timedelta
 
 # Ensure parent dir is on sys.path for mt5_connector / get_b3_data
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -44,28 +41,21 @@ PARENT_DIR = os.path.dirname(SCRIPT_DIR)
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
-from constants import ASSET_SYMBOL, USE_KALMAN
-from gex_utils import find_gamma_flip
-from gex_plots import plot_notional_by_strike, plot_gex_friday, plot_gex_all_expiry
+from constants import ASSET_SYMBOL
+from gex_utils import find_gamma_flip, compute_weekly_walls
+from gex_plots import plot_notional_by_strike, plot_gex_all_expiry, plot_gex_weekly
 from b3_options_loader import load_b3_options_data
-
-from kalman_price_mapper import (
-    KalmanPriceMapper,
-    OLSPriceMapper,
-    build_ind_bova11_mapper,
-    build_ind_bova11_ols_mapper,
-    calculate_delta_neutral_hedge,
-)
-
 from mt5_connector import MT5Connector
+from di1_rate_curve import build_di1_curve
+from kalman_price_mapper import build_ind_bova11_mapper, build_ind_bova11_mapper_intraday
 
 
-async def analyze_options(spot: float, underlying: str = "PETR4", ind_mapper: KalmanPriceMapper = None, show_plots: bool = False):
+async def analyze_options(spot: float, underlying: str = "PETR4", show_plots: bool = False, win_mapper=None):
        """
        Fetch options data from B3, compute Greeks via Black-Scholes, and analyze.
        Spot is passed as a parameter so the analysis aligns with current price.
-       If ind_mapper is provided, $IND equivalents are printed alongside BOVA11 levels.
        If show_plots is False, all matplotlib charts are suppressed.
+       win_mapper: KalmanPriceMapper for converting BOVA11 levels to WIN$N (only for BOVA11).
        """
 
        df = load_b3_options_data(underlying, spot)
@@ -86,7 +76,7 @@ async def analyze_options(spot: float, underlying: str = "PETR4", ind_mapper: Ka
        total_puts  = puts['Tit.'].sum()
        pcr_global = total_puts / total_calls if total_calls > 0 else np.nan
 
-       print(f"\n===== STOCK OPTIONS — Global PCR =====")
+       print(f"\n===== STOCK OPTIONS -- Global PCR =====")
        print(f"Spot: {spot:.2f}")
        print(f"Total Calls: {total_calls:,.2f}")
        print(f"Total Puts : {total_puts:,.2f}")
@@ -118,7 +108,7 @@ async def analyze_options(spot: float, underlying: str = "PETR4", ind_mapper: Ka
        ]
        rows = []
        for (low, high) in bins:
-           label = f"{low:.2f}-{high if np.isfinite(high) else '∞'}"
+           label = f"{low:.2f}-{high if np.isfinite(high) else 'Inf'}"
            c = calls[(calls['Strike']>=low)&(calls['Strike']<high)]['Tit.'].sum()
            p = puts[(puts['Strike']>=low)&(puts['Strike']<high)]['Tit.'].sum()
            pcr = p/c if c>0 else np.nan
@@ -134,9 +124,9 @@ async def analyze_options(spot: float, underlying: str = "PETR4", ind_mapper: Ka
        plot_notional_by_strike(vol_by_strike, spot, underlying, show_plots)
 
        # ------------------------------------------------------------
-       # GAMMA EXPOSURE (Customer)
+       # GAMMA EXPOSURE (Customer)  —  Dollar Gamma = bs_gamma × S² × OI
        # ------------------------------------------------------------
-       df['GEX_customer'] = df['Gamma'] * (spot**2) * df['Tit.']
+       df['GEX_customer'] = df['Gamma'] * (spot ** 2) * df['Tit.']
        df['GEX_customer'] = df['GEX_customer'] * np.where(df['Tipo'].str.upper().str.contains('CALL'), 1, -1)
    
        gex_by_strike = df.groupby('Strike', as_index=False).agg(
@@ -144,73 +134,52 @@ async def analyze_options(spot: float, underlying: str = "PETR4", ind_mapper: Ka
        ).sort_values('Strike')
 
        # ============================================================
-       # GEX FOR NEXT FRIDAY (Weekly Expiration)
+       # GEX FOR CURRENT WEEK & NEXT WEEK (Weekly Gamma Walls)
        # ============================================================
-       today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-       days_until_friday = (4 - today.weekday()) % 7  # 4 = Friday
-       if days_until_friday == 0:
-           days_until_friday = 7  # if today is Friday, use next Friday
-       next_friday = today + timedelta(days=days_until_friday)
-       next_friday_str = next_friday.strftime('%Y-%m-%d')
+       weekly_results = compute_weekly_walls(df, spot)
 
        print(f"\n{'='*75}")
-       print(f"GEX FOR NEXT FRIDAY ({next_friday_str})")
+       print(f"WEEKLY GAMMA WALLS -- Current Week & Next Week")
        print(f"{'='*75}")
 
-       # Filter options expiring on next Friday
-       df['Expiration'] = pd.to_datetime(df['Expiration'])
-       fri_df = df[df['Expiration'].dt.date == next_friday.date()]
+       avail_exp = sorted(pd.to_datetime(df['Expiration']).dt.date.unique())
+       for wk in weekly_results:
+           if wk['gex_by_strike'].empty:
+               print(f"\n  {wk['label']}: No options expiring on {wk['friday_str']}")
+               print(f"  Available expirations: {[str(d) for d in avail_exp[:10]]}")
+               continue
 
-       if fri_df.empty:
-           print(f"  No options expiring on {next_friday_str}")
-           # Show available expirations for reference
-           avail_exp = sorted(df['Expiration'].dt.date.unique())
-           print(f"  Available expirations: {[str(d) for d in avail_exp[:10]]}")
-       else:
-           fri_calls = fri_df[fri_df['Tipo'].str.upper().str.contains('CALL')]
-           fri_puts  = fri_df[fri_df['Tipo'].str.upper().str.contains('PUT')]
+           n_calls = len(wk['calls'])
+           n_puts  = len(wk['puts'])
+           print(f"\n  {wk['label']}: {wk['friday_str']} ({wk['dte']} BD)")
+           print(f"    Contracts: {n_calls} calls, {n_puts} puts")
+           print(f"    Total GEX: {wk['total_gex']/1e6:>10.2f}M")
+           print(f"    Peak GEX strike: {wk['peak_gex_strike']:.2f}")
+           if np.isfinite(wk['gamma_flip']):
+               print(f"    Gamma Flip: {wk['gamma_flip']:.2f}")
+           if np.isfinite(wk['call_wall']):
+               print(f"    Call Wall:  {wk['call_wall']:.2f}")
+           if np.isfinite(wk['put_wall']):
+               print(f"    Put Wall:   {wk['put_wall']:.2f}")
 
-           fri_gex_by_strike = fri_df.groupby('Strike', as_index=False).agg(
+       plot_gex_weekly(weekly_results, spot, underlying, show_plots)
+
+       # Combined Call/Put Walls — current + next week expirations only
+       combined_wk_dfs = [wk['gex_by_strike'] for wk in weekly_results if not wk['gex_by_strike'].empty]
+       if combined_wk_dfs:
+           combined_gex = pd.concat(combined_wk_dfs).groupby('Strike', as_index=False).agg(
                GEX_customer=('GEX_customer', 'sum')
            ).sort_values('Strike')
+       else:
+           combined_gex = gex_by_strike  # fallback to all expiries
 
-           total_gex = fri_gex_by_strike['GEX_customer'].sum()
-           max_gex_strike = fri_gex_by_strike.loc[
-               fri_gex_by_strike['GEX_customer'].abs().idxmax(), 'Strike'
-           ]
+       combined_fridays = [wk['friday_date'] for wk in weekly_results]
+       df['Expiration'] = pd.to_datetime(df['Expiration'])
+       wk_mask = df['Expiration'].dt.date.isin([f.date() for f in combined_fridays])
+       df_2wk = df[wk_mask] if wk_mask.any() else df
 
-           # Gamma flip (zero crossing nearest to spot)
-           fri_gvals = fri_gex_by_strike['GEX_customer'].to_numpy()
-           fri_strikes = fri_gex_by_strike['Strike'].to_numpy()
-           fri_flip = find_gamma_flip(fri_strikes, fri_gvals, spot)
-
-           # Walls — call wall >= spot (resistance), put wall <= spot (support)
-           fri_call_gex = fri_calls.groupby('Strike')['GEX_customer'].sum() if not fri_calls.empty else pd.Series(dtype=float)
-           fri_call_above = fri_call_gex[fri_call_gex.index >= spot]
-           fri_call_wall = fri_call_above.idxmax() if not fri_call_above.empty else np.nan
-           fri_put_gex   = fri_puts.groupby('Strike')['GEX_customer'].sum() if not fri_puts.empty else pd.Series(dtype=float)
-           fri_put_below = fri_put_gex[fri_put_gex.index <= spot]
-           fri_put_wall  = fri_put_below.abs().idxmax() if not fri_put_below.empty else np.nan
-
-           fri_dte = (next_friday - today).days
-           print(f"\n  Next Friday: {next_friday_str} ({fri_dte} DTE)")
-           print(f"    Contracts: {len(fri_calls)} calls, {len(fri_puts)} puts")
-           print(f"    Total GEX: {total_gex/1e6:>10.2f}M")
-           print(f"    Peak GEX strike: {max_gex_strike:.2f}")
-           if np.isfinite(fri_flip):
-               print(f"    Gamma Flip: {fri_flip:.2f}")
-           if np.isfinite(fri_call_wall):
-               print(f"    Call Wall:  {fri_call_wall:.2f}")
-           if np.isfinite(fri_put_wall):
-               print(f"    Put Wall:   {fri_put_wall:.2f}")
-
-           plot_gex_friday(fri_gex_by_strike, spot, underlying,
-                          next_friday_str, fri_dte, fri_flip,
-                          fri_call_wall, fri_put_wall, show_plots)
-
-       # Call/Put Walls — strike with max gamma exposure per side
-       gex_calls = df[df['Tipo'].str.upper().str.contains('CALL')]
-       gex_puts  = df[df['Tipo'].str.upper().str.contains('PUT')]
+       gex_calls = df_2wk[df_2wk['Tipo'].str.upper().str.contains('CALL')]
+       gex_puts  = df_2wk[df_2wk['Tipo'].str.upper().str.contains('PUT')]
 
        call_gex_by_strike = gex_calls.groupby('Strike')['GEX_customer'].sum()
        call_gex_above = call_gex_by_strike[call_gex_by_strike.index >= spot]
@@ -220,22 +189,21 @@ async def analyze_options(spot: float, underlying: str = "PETR4", ind_mapper: Ka
        put_gex_below = put_gex_by_strike[put_gex_by_strike.index <= spot]
        put_wall  = put_gex_below.abs().idxmax() if not put_gex_below.empty else np.nan
 
-       # Gamma Flip — zero crossing of customer GEX nearest to spot
-       gvals = gex_by_strike['GEX_customer'].to_numpy()
-       strikes = gex_by_strike['Strike'].to_numpy()
-       gamma_flip = find_gamma_flip(strikes, gvals, spot)
+       # Gamma Flip — scan-based: re-evaluate gamma at each test price
+       gamma_flip = find_gamma_flip(df_2wk, spot)
 
-       print(f"\n===== Call/Put Walls =====")
+       wk_labels = " + ".join(wk['friday_str'] for wk in weekly_results)
+       print(f"\n===== Combined Walls (Current + Next Week: {wk_labels}) =====")
        print(f"Call Wall: {call_wall:.2f}")
        print(f"Put  Wall: {put_wall:.2f}")
        print(f"Gamma Flip (approx): {gamma_flip:.2f}")
 
-       plot_gex_all_expiry(gex_by_strike, spot, underlying, gamma_flip,
+       plot_gex_all_expiry(combined_gex, spot, underlying, gamma_flip,
                           call_wall, put_wall, show_plots)
    
        # Extended Market Structure Metrics
        print("\n" + "="*75)
-       print("EXTENDED MARKET STRUCTURE METRICS — STOCK TRACE-Lite View")
+       print("EXTENDED MARKET STRUCTURE METRICS -- STOCK TRACE-Lite View")
        print("="*75)
    
        print(f"Put/Call Ratio (OI):  {pcr_global:>6.2f}")
@@ -250,12 +218,12 @@ async def analyze_options(spot: float, underlying: str = "PETR4", ind_mapper: Ka
        print("\nVolatility Skew:")
        print(f"IV (OTM Puts):   {iv_puts_otm:>6.2f}%")
        print(f"IV (OTM Calls):  {iv_calls_otm:>6.2f}%")
-       print(f"Skew (Puts−Calls): {iv_skew:>6.2f}%")
+       print(f"Skew (Puts-Calls): {iv_skew:>6.2f}%")
    
        if iv_skew > 10:
-           print("Interpretation:  Elevated skew — investors hedging downside risk.")
+           print("Interpretation:  Elevated skew -- investors hedging downside risk.")
        elif iv_skew < 0:
-           print("Interpretation:  Inverted skew — speculative upside bias.")
+           print("Interpretation:  Inverted skew -- speculative upside bias.")
        else:
            print("Interpretation:  Balanced implied vol surface.")
    
@@ -269,9 +237,9 @@ async def analyze_options(spot: float, underlying: str = "PETR4", ind_mapper: Ka
            side = "above" if diff > 0 else "below"
            print(f"Spot is {abs(pct):.2f}% {side} the flip.")
            if diff > 0:
-               print("→ Dealers long gamma: market mechanically dampened.")
+               print("-> Dealers long gamma: market mechanically dampened.")
            else:
-               print("→ Dealers short gamma: market mechanically amplified.")
+               print("-> Dealers short gamma: market mechanically amplified.")
 
        # Market regime classification (positive gamma: spot > gamma_flip)
        if np.isfinite(gamma_flip):
@@ -301,94 +269,104 @@ async def analyze_options(spot: float, underlying: str = "PETR4", ind_mapper: Ka
        resist = gex_sorted.head(4)
        supports = gex_sorted.tail(4)
    
-       print("Support Zones (dealers short gamma on puts → hedge-buying cushion):")
+       print("Support Zones (dealers short gamma on puts -> hedge-buying cushion):")
        for _, r in supports.iterrows():
            gex_mil = r["GEX_customer"] / 1e6
            strength = "Strong" if abs(gex_mil) > 200 else "Moderate" if abs(gex_mil) > 100 else "Weak"
            print(f"  Strike {r['Strike']:>8.2f} | {gex_mil:>7.2f}M | {strength}")
    
-       print("\nResistance Zones (dealers long gamma → counter-trend selling caps rallies):")
+       print("\nResistance Zones (dealers long gamma -> counter-trend selling caps rallies):")
        for _, r in resist.iterrows():
            gex_mil = r["GEX_customer"] / 1e6
            strength = "Strong" if abs(gex_mil) > 200 else "Moderate" if abs(gex_mil) > 100 else "Weak"
            print(f"  Strike {r['Strike']:>8.2f} | +{gex_mil:>7.2f}M | {strength}")
    
        # Summary Snapshot
-       print("\nSummary Snapshot:")
-       if ind_mapper is not None:
-           ind_spot       = ind_mapper.bova11_to_ind(spot)
-           ind_call_wall  = ind_mapper.bova11_to_ind(call_wall)
-           ind_put_wall   = ind_mapper.bova11_to_ind(put_wall)
-           ind_gamma_flip = ind_mapper.bova11_to_ind(gamma_flip)
+       # Helper to format BOVA11 + WIN$N side by side
+       def _fmt(label, bova_val):
+           if not np.isfinite(bova_val):
+               return f"  {label:<25s} N/A"
+           if win_mapper is not None:
+               win_val = win_mapper.bova11_to_ind(bova_val)
+               return f"  {label:<25s} {bova_val:>10,.2f}   |  WIN$N {win_val:>10,.0f}"
+           return f"  {label:<25s} {bova_val:>10,.2f}"
 
-           # Fetch live $IND price for comparison with regression estimate
-           model_label = "Kalman" if USE_KALMAN else "OLS"
-           _mt5 = MT5Connector()
-           ind_live_info = _mt5.get_symbol_info("WIN$N")
-           if ind_live_info is not None and (ind_live_info.bid + ind_live_info.ask) > 0:
-               ind_live = (ind_live_info.bid + ind_live_info.ask) / 2
-               ind_diff = ind_spot - ind_live
-               ind_diff_pct = ind_diff / ind_live * 100
-               print(f"{'':>15} {'BOVA11':>12} {f'$IND {model_label}':>14} {'$IND Live':>14} {'Diff':>10}")
-               print(f"  {'Spot':<13} {spot:>12,.2f} {ind_spot:>14,.0f} {ind_live:>14,.0f} {ind_diff_pct:>+9.2f}%")
-           else:
-               ind_live = None
-               print(f"{'':>15} {'BOVA11':>12} {f'$IND {model_label}':>14}")
-               print(f"  {'Spot':<13} {spot:>12,.2f} {ind_spot:>14,.0f}")
+       header = "BOVA11" if win_mapper is not None else underlying
+       win_hdr = "  |  WIN$N" if win_mapper is not None else ""
 
-           print(f"  {'Call Wall':<13} {call_wall:>12,.2f} {ind_call_wall:>14,.0f}")
-           print(f"  {'Put Wall':<13} {put_wall:>12,.2f} {ind_put_wall:>14,.0f}")
-           print(f"  {'Gamma Flip':<13} {gamma_flip:>12,.2f} {ind_gamma_flip:>14,.0f}")
-           print(f"  {model_label} β = {ind_mapper.beta:,.4f}  α = {ind_mapper.alpha:,.2f}")
-
-           # Delta-neutral hedge estimate
-           print(f"\n  Delta-Neutral Hedge (1 WIN long → buy BOVA11 puts):")
-           try:
-               dn = calculate_delta_neutral_hedge(ind_mapper, df, spot,
-                                                  win_contracts=1, side='put')
-               print(f"    Option:     {dn['ticker']}  (strike {dn['strike']:.2f}, "
-                     f"DTE {dn['dte']}, IV {dn['iv']:.1%})")
-               print(f"    Δ option:   {dn['option_delta']:+.4f}")
-               print(f"    Qty needed: {dn['n_options']} puts")
-               print(f"    Net Δ:      {dn['net_delta']:+.4f}")
-               print(f"    $IND strike: {dn['ind_strike']:,.0f}")
-           except Exception as e:
-               print(f"    [!] Could not estimate: {e}")
-
+       print(f"\nSummary Snapshot ({header}{win_hdr}):")
+       if win_mapper is not None:
+           win_spot = win_mapper.bova11_to_ind(spot)
+           print(f"  {'Spot:':<25s} {spot:>10,.2f}   |  WIN$N {win_spot:>10,.0f}")
        else:
-           print(f"Spot:        {spot:,.2f}")
-           print(f"Call Wall:   {call_wall:,.2f}")
-           print(f"Put Wall:    {put_wall:,.2f}")
-           print(f"Gamma Flip:  {gamma_flip:,.2f}")
-       print(f"Market Regime: {regime}")
+           print(f"  {'Spot:':<25s} {spot:>10,.2f}")
+
+       print(f"\nWalls by Expiration Date:")
+       for wk in weekly_results:
+           if wk['gex_by_strike'].empty:
+               print(f"  {wk['friday_str']}  -- No data")
+               continue
+           wk_cw = wk['call_wall']
+           wk_pw = wk['put_wall']
+           wk_flip = wk['gamma_flip']
+           print(f"\n  {wk['friday_str']} ({wk['label']}, {wk['dte']} BD):")
+           print(_fmt("Call Wall:", wk_cw))
+           print(_fmt("Put Wall:", wk_pw))
+           print(_fmt("Gamma Flip:", wk_flip))
+
+       # Support & Resistance zones — average of weekly walls + gamma flip
+       valid_cw = [wk['call_wall'] for wk in weekly_results
+                   if not wk['gex_by_strike'].empty and np.isfinite(wk['call_wall'])]
+       valid_pw = [wk['put_wall'] for wk in weekly_results
+                   if not wk['gex_by_strike'].empty and np.isfinite(wk['put_wall'])]
+       valid_gf = [wk['gamma_flip'] for wk in weekly_results
+                   if not wk['gex_by_strike'].empty and np.isfinite(wk['gamma_flip'])]
+       avg_resistance = np.mean(valid_cw) if valid_cw else np.nan
+       avg_support = np.mean(valid_pw) if valid_pw else np.nan
+       avg_gamma_flip = np.mean(valid_gf) if valid_gf else np.nan
+
+       print(f"\nKey Zones (avg of weekly walls):")
+       print(_fmt("Resistance (Call Wall):", avg_resistance))
+       print(_fmt("Support (Put Wall):", avg_support))
+       print(_fmt("Gamma Flip:", avg_gamma_flip))
+
+       print(f"\nMarket Regime: {regime}")
        print("="*75)
 
 async def main():
     mt5_conn = MT5Connector()
 
-    # Build price mapper: BOVA11 ↔ $IND
-    try:
-        if USE_KALMAN:
-            ind_mapper = build_ind_bova11_mapper(mt5_conn)
-        else:
-            ind_mapper = build_ind_bova11_ols_mapper(mt5_conn)
-    except Exception as e:
-        print(f"[!] Could not build IND↔BOVA11 mapper: {e}")
-        ind_mapper = None
+    # Build DI1 term-structure once (spline-interpolated per expiry)
+    build_di1_curve(mt5_conn)
+
+    # Build Kalman mapper WIN$N <-> BOVA11 on 15-min bars (best for intraday)
+    win_mapper = None
+    if "BOVA11" in ASSET_SYMBOL:
+        try:
+            win_mapper = build_ind_bova11_mapper_intraday(
+                mt5_conn, ind_symbol="WIN$N", bova11_symbol="BOVA11"
+            )
+        except Exception as e:
+            print(f"[!] Could not build WIN-BOVA11 intraday mapper: {e}")
+            # Fallback to daily mapper
+            try:
+                win_mapper = build_ind_bova11_mapper(mt5_conn, ind_symbol="WIN$N", bova11_symbol="BOVA11")
+                print("[!] Falling back to daily mapper")
+            except Exception as e2:
+                print(f"[!] Daily mapper also failed: {e2}")
 
     for asset in ASSET_SYMBOL:
         print(f"\n{'#'*80}\nAnalyzing {asset}...\n{'#'*80}")
         symbol_info = mt5_conn.get_symbol_info(asset)
         if symbol_info is None:
-            print(f"[X] Could not get symbol info for {asset} — skipping.")
+            print(f"[X] Could not get symbol info for {asset} -- skipping.")
             continue
         spot_price = (symbol_info.bid + symbol_info.ask) / 2
         if spot_price <= 0:
-            print(f"[X] Spot price for {asset} is {spot_price:.2f} (bid={symbol_info.bid}, ask={symbol_info.ask}) — skipping.")
+            print(f"[X] Spot price for {asset} is {spot_price:.2f} (bid={symbol_info.bid}, ask={symbol_info.ask}) -- skipping.")
             continue
         print(f"Analyzing options data for {asset} with spot price {spot_price:.2f}...")
-        # Pass ind_mapper only when analyzing BOVA11
-        mapper_for_asset = ind_mapper if asset == "BOVA11" else None
-        await analyze_options(spot_price, asset, ind_mapper=mapper_for_asset, show_plots=True)
+        mapper_for_asset = win_mapper if asset == "BOVA11" else None
+        await analyze_options(spot_price, asset, show_plots=True, win_mapper=mapper_for_asset)
 
 asyncio.run(main())

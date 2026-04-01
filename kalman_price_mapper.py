@@ -7,6 +7,7 @@ Provides:
   - build_ind_bova11_mapper: fits the mapper from MT5 historical data
   - calculate_hedge_options : notional-based hedge sizing
   - calculate_delta_neutral_hedge : delta-neutral hedge from live option chain
+
 """
 
 import numpy as np
@@ -161,70 +162,6 @@ class KalmanPriceMapper:
 
 
 # ============================================================
-# OLS Price Mapper — simple linear regression on log prices
-# ============================================================
-class OLSPriceMapper:
-    """
-    Ordinary Least Squares regression on log prices:
-        log(IND) = alpha + beta * log(BOVA11)
-
-    Same interface as KalmanPriceMapper (alpha, beta, bova11_to_ind,
-    ind_to_bova11) so they can be used interchangeably.
-    """
-
-    def __init__(self):
-        self._alpha = 0.0
-        self._beta = 0.0
-        self.r_squared = 0.0
-        self.residual_std = 0.0
-
-    def fit(self, ind_log_prices: np.ndarray, bova11_log_prices: np.ndarray) -> pd.DataFrame:
-        """Fit OLS: log(IND) = alpha + beta * log(BOVA11)."""
-        coeffs = np.polyfit(bova11_log_prices, ind_log_prices, 1)
-        self._beta = coeffs[0]
-        self._alpha = coeffs[1]
-
-        estimated = self._alpha + self._beta * bova11_log_prices
-        residuals = ind_log_prices - estimated
-        ss_res = np.sum(residuals ** 2)
-        ss_tot = np.sum((ind_log_prices - np.mean(ind_log_prices)) ** 2)
-        self.r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
-        self.residual_std = np.std(residuals)
-
-        return pd.DataFrame({
-            'ind': ind_log_prices,
-            'bova11': bova11_log_prices,
-            'alpha': self._alpha,
-            'beta': self._beta,
-            'ind_estimated': estimated,
-            'residual': residuals,
-        })
-
-    @property
-    def alpha(self) -> float:
-        return self._alpha
-
-    @property
-    def beta(self) -> float:
-        return self._beta
-
-    def bova11_to_ind(self, bova11_price: float, log_input: bool = False) -> float:
-        if log_input:
-            return np.exp(self._alpha + self._beta * bova11_price)
-        return np.exp(self._alpha + self._beta * np.log(bova11_price))
-
-    def ind_to_bova11(self, ind_price: float, log_input: bool = False) -> float:
-        if self._beta == 0:
-            raise ValueError("beta is zero — model not fitted yet")
-        if log_input:
-            return np.exp((ind_price - self._alpha) / self._beta)
-        return np.exp((np.log(ind_price) - self._alpha) / self._beta)
-
-    def convert_strikes(self, strikes: np.ndarray) -> np.ndarray:
-        return self._alpha + self._beta * np.asarray(strikes, dtype=np.float64)
-
-
-# ============================================================
 # Builder — fetch from MT5 and fit
 # ============================================================
 def build_ind_bova11_mapper(mt5_conn,
@@ -271,10 +208,10 @@ def build_ind_bova11_mapper(mt5_conn,
     df_bova = df_bova.set_index('time')[['close']].rename(columns={'close': 'bova11'})
     merged = df_ind.join(df_bova, how='inner').dropna()
 
-    if len(merged) < 31:
+    if len(merged) < 5:
         raise RuntimeError(
-            f"Only {len(merged)} overlapping bars — need at least 31 for a "
-            "reliable calibration (log returns require at least 31)."
+            f"Only {len(merged)} overlapping bars -- need at least 5 for "
+            "a reliable calibration."
         )
 
     # Calculate log prices
@@ -302,50 +239,9 @@ def build_ind_bova11_mapper(mt5_conn,
     )
 
     print(f"[KalmanPriceMapper] Fitted on {len(merged)} daily log prices")
-    print(f"  Latest α = {mapper.alpha:,.6f}  β = {mapper.beta:,.6f}")
+    print(f"  Latest alpha = {mapper.alpha:,.6f}  beta = {mapper.beta:,.6f}")
     print(f"  Residual std = {results['residual'].std():,.6f} (log price units)")
-    print(f"  Example: BOVA11 log {merged['bova11_log'].iloc[-1]:.6f} → "
-          f"$IND log {mapper.bova11_to_ind(merged['bova11_log'].iloc[-1]):,.6f} "
-          f"(actual {merged['ind_log'].iloc[-1]:,.6f})")
-
-    return mapper
-
-
-def build_ind_bova11_ols_mapper(mt5_conn,
-                                ind_symbol: str = "WIN$N",
-                                bova11_symbol: str = "BOVA11",
-                                periods: int = PERIODS) -> OLSPriceMapper:
-    """
-    Fetch historical daily close prices from MT5 for $IND and BOVA11,
-    fit an OLS regression on log prices, and return an OLSPriceMapper.
-    """
-    df_ind = mt5_conn.get_data(ind_symbol, mt5_conn.TIMEFRAME_D1, periods, SHIFT_PERIODS)
-    df_bova = mt5_conn.get_data(bova11_symbol, mt5_conn.TIMEFRAME_D1, periods, SHIFT_PERIODS)
-
-    if df_ind is None or df_bova is None:
-        raise RuntimeError(
-            f"Could not fetch data for {ind_symbol} and/or {bova11_symbol}. "
-            "Make sure both symbols are available in MT5 Market Watch."
-        )
-
-    df_ind = df_ind.set_index('time')[['close']].rename(columns={'close': 'ind'})
-    df_bova = df_bova.set_index('time')[['close']].rename(columns={'close': 'bova11'})
-    merged = df_ind.join(df_bova, how='inner').dropna()
-
-    if len(merged) < 10:
-        raise RuntimeError(f"Only {len(merged)} overlapping bars — need at least 10.")
-
-    merged['ind_log'] = np.log(merged['ind'])
-    merged['bova11_log'] = np.log(merged['bova11'])
-    merged = merged.dropna(subset=['ind_log', 'bova11_log'])
-
-    mapper = OLSPriceMapper()
-    results = mapper.fit(merged['ind_log'].values, merged['bova11_log'].values)
-
-    print(f"[OLSPriceMapper] Fitted on {len(merged)} daily log prices")
-    print(f"  α = {mapper.alpha:,.6f}  β = {mapper.beta:,.6f}  R² = {mapper.r_squared:.6f}")
-    print(f"  Residual std = {mapper.residual_std:,.6f} (log price units)")
-    print(f"  Example: BOVA11 log {merged['bova11_log'].iloc[-1]:.6f} → "
+    print(f"  Example: BOVA11 log {merged['bova11_log'].iloc[-1]:.6f} -> "
           f"$IND log {mapper.bova11_to_ind(merged['bova11_log'].iloc[-1]):,.6f} "
           f"(actual {merged['ind_log'].iloc[-1]:,.6f})")
 
@@ -353,7 +249,169 @@ def build_ind_bova11_ols_mapper(mt5_conn,
 
 
 # ============================================================
-# WIN ↔ BOVA11 Options Hedge Sizing
+# Intraday 15-min Builder -- auto-select best lookback
+# ============================================================
+# B3 regular session: ~7 hours = 28 bars of 15 min per day
+BARS_PER_DAY_15M = 28
+
+
+def _build_candidate_days(max_days: int) -> list:
+    """Generate candidate lookback periods up to max_days.
+    
+    Always includes 1, 2, 3 and then adds 5, 10, 15, 20 if they fit.
+    This ensures we always test short windows plus whatever the user sets.
+    """
+    base = [1, 2, 3, 5, 10, 15, 20]
+    # Include max_days itself if not already in the list
+    candidates = sorted(set([d for d in base if d <= max_days] + [max_days]))
+    return candidates
+
+
+def build_ind_bova11_mapper_intraday(
+    mt5_conn,
+    ind_symbol: str = "WIN$N",
+    bova11_symbol: str = "BOVA11",
+    max_days: int = PERIODS,
+    delta: float = 1e-3,
+    observation_noise: float = 10.0,
+) -> KalmanPriceMapper:
+    """
+    Fit a KalmanPriceMapper on 15-min bars, automatically selecting the
+    lookback period that minimises out-of-sample residual error.
+
+    The candidate lookback periods are generated from PERIODS (constants.py).
+    Change PERIODS to control the max lookback tested.
+
+    Strategy
+    --------
+    For each candidate lookback (up to max_days trading days) we:
+      1. Fetch 15-min bars and align timestamps.
+      2. Split 80% train / 20% test.
+      3. Fit the Kalman filter on train.
+      4. Measure mean-absolute-error (MAE) on test (in index points).
+      5. Pick the lookback with lowest test MAE.
+
+    Then re-fit the winner on the full period and return the mapper.
+
+    Parameters
+    ----------
+    max_days : int
+        Maximum lookback in trading days to test. Driven by PERIODS in
+        constants.py. Default candidates: 1,2,3 and up to max_days.
+
+    Returns
+    -------
+    KalmanPriceMapper
+        Fitted on 15-min bars, ready for bova11_to_ind / ind_to_bova11.
+    """
+    candidate_days = _build_candidate_days(max_days)
+    
+    best_mae = np.inf
+    best_days = candidate_days[0]
+    results_table = []
+
+    for days in candidate_days:
+        n_bars = days * BARS_PER_DAY_15M + 10  # small buffer
+
+        df_ind = mt5_conn.get_data(ind_symbol, mt5_conn.TIMEFRAME_M15,
+                                   n_bars, SHIFT_PERIODS)
+        df_bova = mt5_conn.get_data(bova11_symbol, mt5_conn.TIMEFRAME_M15,
+                                    n_bars, SHIFT_PERIODS)
+
+        if df_ind is None or df_bova is None:
+            results_table.append((days, n_bars, 0, np.nan, "no data"))
+            continue
+
+        # Align on timestamp
+        df_i = df_ind.set_index('time')[['close']].rename(columns={'close': 'ind'})
+        df_b = df_bova.set_index('time')[['close']].rename(columns={'close': 'bova11'})
+        merged = df_i.join(df_b, how='inner').dropna()
+        merged = merged[(merged['ind'] > 0) & (merged['bova11'] > 0)]
+
+        if len(merged) < 10:
+            results_table.append((days, n_bars, len(merged), np.nan, "too few bars"))
+            continue
+
+        # Log prices
+        ind_log = np.log(merged['ind'].values)
+        bova_log = np.log(merged['bova11'].values)
+
+        # Train/test split (80/20)
+        split = int(len(merged) * 0.8)
+        train_ind, test_ind = ind_log[:split], ind_log[split:]
+        train_bova, test_bova = bova_log[:split], bova_log[split:]
+
+        # OLS seed
+        lookback = min(60, len(train_ind))
+        ols_coeffs = np.polyfit(train_bova[-lookback:], train_ind[-lookback:], 1)
+
+        # Fit on train
+        mapper = KalmanPriceMapper(
+            delta=delta,
+            observation_noise=observation_noise,
+            initial_beta=ols_coeffs[0],
+        )
+        mapper.fit(train_ind, train_bova)
+
+        # Evaluate on test -- step through with updates
+        errors = []
+        for t_ind, t_bova in zip(test_ind, test_bova):
+            predicted = mapper.alpha + mapper.beta * t_bova
+            error_pts = abs(np.exp(t_ind) - np.exp(predicted))
+            errors.append(error_pts)
+            mapper.update(t_ind, t_bova)
+
+        mae = np.mean(errors)
+        results_table.append((days, n_bars, len(merged), mae, "ok"))
+
+        if mae < best_mae:
+            best_mae = mae
+            best_days = days
+
+    # Print comparison table
+    print(f"\n[KalmanPriceMapper] Intraday 15-min -- lookback selection:")
+    print(f"  {'Days':>5s}  {'Bars':>6s}  {'Aligned':>7s}  {'MAE (pts)':>10s}  Status")
+    print(f"  {'-'*5}  {'-'*6}  {'-'*7}  {'-'*10}  {'-'*10}")
+    for days, n_bars, n_aligned, mae, status in results_table:
+        mae_str = f"{mae:>10.1f}" if np.isfinite(mae) else f"{'N/A':>10s}"
+        marker = " <-- BEST" if days == best_days and np.isfinite(mae) else ""
+        print(f"  {days:>5d}  {n_bars:>6d}  {n_aligned:>7d}  {mae_str}  {status}{marker}")
+
+    # Re-fit best period on ALL data
+    n_bars = best_days * BARS_PER_DAY_15M + 10
+    df_ind = mt5_conn.get_data(ind_symbol, mt5_conn.TIMEFRAME_M15,
+                               n_bars, SHIFT_PERIODS)
+    df_bova = mt5_conn.get_data(bova11_symbol, mt5_conn.TIMEFRAME_M15,
+                                n_bars, SHIFT_PERIODS)
+
+    df_i = df_ind.set_index('time')[['close']].rename(columns={'close': 'ind'})
+    df_b = df_bova.set_index('time')[['close']].rename(columns={'close': 'bova11'})
+    merged = df_i.join(df_b, how='inner').dropna()
+    merged = merged[(merged['ind'] > 0) & (merged['bova11'] > 0)]
+
+    ind_log = np.log(merged['ind'].values)
+    bova_log = np.log(merged['bova11'].values)
+
+    lookback = min(60, len(merged))
+    ols_coeffs = np.polyfit(bova_log[-lookback:], ind_log[-lookback:], 1)
+
+    final_mapper = KalmanPriceMapper(
+        delta=delta,
+        observation_noise=observation_noise,
+        initial_beta=ols_coeffs[0],
+    )
+    results_df = final_mapper.fit(ind_log, bova_log)
+
+    print(f"\n  Winner: {best_days} days ({len(merged)} bars of 15-min)")
+    print(f"  MAE:    {best_mae:.1f} index points")
+    print(f"  alpha = {final_mapper.alpha:,.6f}  beta = {final_mapper.beta:,.6f}")
+    print(f"  Residual std = {results_df['residual'].std():,.6f} (log units)")
+
+    return final_mapper
+
+
+# ============================================================
+# WIN <-> BOVA11 Options Hedge Sizing
 # ============================================================
 WIN_POINT_VALUE = 0.20  # BRL per index point for WIN mini contracts
 

@@ -12,11 +12,11 @@ import pandas as pd
 from datetime import datetime
 
 from bs_greeks import (
-    RISK_FREE_RATE,
     bs_gamma,
     bs_delta,
     implied_vol,
 )
+from di1_rate_curve import get_rate_for_date, FALLBACK_RATE
 
 # Resolve paths so get_b3_data is importable
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -59,29 +59,32 @@ def load_b3_options_data(underlying, spot, date=None):
     options['Tipo'] = options['ticker'].apply(classify_type)
     options = options.dropna(subset=['Tipo'])
 
-    # Parse expiration and compute time to expiry + DTE
+    # Parse expiration and compute time to expiry + DTE (business days)
     now = datetime.now()
     def parse_expiration(exp_str):
         try:
             exp_date = datetime.strptime(str(exp_str).strip(), '%Y%m%d')
-            dte = max((exp_date - now).days, 0)
-            T = max(dte / 365.0, 1 / 365)
+            dte = max(int(np.busday_count(now.date(), exp_date.date())), 0)
+            T = max(dte / 252.0, 1 / 252)
             return T, dte, exp_date
         except (ValueError, TypeError):
-            return 28 / 365, 28, now  # fallback ~1 month
+            return 20 / 252, 20, now  # fallback ~1 month bdays
 
     parsed = options['expiration'].apply(parse_expiration)
     options['T'] = parsed.apply(lambda x: x[0])
     options['DTE'] = parsed.apply(lambda x: x[1])
     options['Expiration'] = parsed.apply(lambda x: x[2])
 
-    r = RISK_FREE_RATE
-    ivs, gammas, deltas = [], [], []
+    ivs, gammas, deltas, rates = [], [], [], []
     for _, row in options.iterrows():
         opt_type = row['Tipo'].lower()
         strike = float(row['strike'])
         close = float(row['close'])
         T = float(row['T'])
+        exp_date = row['Expiration']
+
+        # Per-expiry rate from DI1 spline (falls back to flat SELIC)
+        r = get_rate_for_date(exp_date)
 
         # Implied vol from market price
         if close > 0 and strike > 0:
@@ -92,6 +95,7 @@ def load_b3_options_data(underlying, spot, date=None):
         gammas.append(bs_gamma(spot, strike, T, r, iv))
         deltas.append(bs_delta(spot, strike, T, r, iv, opt_type))
         ivs.append(iv)  # stored as decimal
+        rates.append(r)
 
     df = pd.DataFrame({
         'Ticker': options['ticker'].values,
