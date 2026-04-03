@@ -50,7 +50,248 @@ from di1_rate_curve import build_di1_curve
 from kalman_price_mapper import build_ind_bova11_mapper, build_ind_bova11_mapper_intraday
 
 
-async def analyze_options(spot: float, underlying: str = "PETR4", show_plots: bool = False, win_mapper=None):
+def _classify_sentiment_from_pcr(pcr_global):
+       """Map PCR to a short sentiment label used in the console snapshot."""
+       if pcr_global is None or not np.isfinite(pcr_global):
+           return "N/A"
+       if pcr_global < 0.90:
+           return "ALTISTA"
+       if pcr_global > 1.10:
+           return "BAIXISTA"
+       return "NEUTRO"
+
+
+def _hedging_state(spot, gamma_flip):
+       """Return a simple hedging state label similar to the dashboard card."""
+       if gamma_flip is None or not np.isfinite(gamma_flip) or gamma_flip == 0:
+           return "N/A"
+       dist_pct = abs((spot - gamma_flip) / gamma_flip) * 100.0
+       if dist_pct <= 0.50:
+           return "DAMPED"
+       return "DAMPED" if spot >= gamma_flip else "AMPLIFIED"
+
+
+def _format_gex_compact(value):
+       """Human-readable GEX formatter (k / M / B) for console summaries."""
+       if value is None or not np.isfinite(value):
+           return "N/A"
+       value = float(value)
+       abs_value = abs(value)
+       sign = "-" if value < 0 else ""
+
+       if abs_value >= 1e9:
+           return f"{sign}{abs_value / 1e9:.1f}B"
+       if abs_value >= 1e6:
+           return f"{sign}{abs_value / 1e6:.1f}M"
+       if abs_value >= 1e3:
+           return f"{sign}{abs_value / 1e3:.1f}k"
+       return f"{value:.1f}"
+
+
+def _select_significant_zones(gex_frame, spot, top_n=3, zone_pct=0.04):
+       """
+       Pick the strongest nearby resistance/support strikes around spot.
+
+       - Resistance: positive GEX strikes at/above spot
+       - Support:    negative GEX strikes at/below spot
+       """
+       if gex_frame is None or gex_frame.empty:
+           return pd.DataFrame(), pd.DataFrame()
+
+       working = gex_frame.copy()
+       lo = spot * (1.0 - zone_pct)
+       hi = spot * (1.0 + zone_pct)
+       window = working[(working["Strike"] >= lo) & (working["Strike"] <= hi)]
+       if not window.empty:
+           working = window
+
+       resist = working[
+           (working["Strike"] >= spot) & (working["GEX_customer"] > 0)
+       ].sort_values(["GEX_customer", "Strike"], ascending=[False, True]).head(top_n)
+
+       support = working[
+           (working["Strike"] <= spot) & (working["GEX_customer"] < 0)
+       ].sort_values(["GEX_customer", "Strike"], ascending=[True, False]).head(top_n)
+
+       if resist.empty:
+           resist = working[working["GEX_customer"] > 0].sort_values(
+               ["GEX_customer", "Strike"], ascending=[False, True]
+           ).head(top_n)
+
+       if support.empty:
+           support = working[working["GEX_customer"] < 0].sort_values(
+               ["GEX_customer", "Strike"], ascending=[True, False]
+           ).head(top_n)
+
+       return resist, support
+
+
+def _build_focus_expiry_snapshot(df, spot, top_n=3, zone_pct=0.04):
+       """
+       Build a support / resistance view for the nearest available expiration.
+
+       This is used only for the console snapshot table so the printed zones can
+       mirror the image-style "Venc. DD/MM" summary more closely.
+       """
+       empty = {
+           "expiry_label": "N/A",
+           "dte": np.nan,
+           "resist_zones": pd.DataFrame(),
+           "support_zones": pd.DataFrame(),
+       }
+
+       if df is None or df.empty or "Expiration" not in df.columns:
+           return empty
+
+       work = df.copy()
+       work["Expiration"] = pd.to_datetime(work["Expiration"], errors="coerce")
+       work = work.dropna(subset=["Expiration", "Strike", "Tit."])
+       if work.empty:
+           return empty
+
+       expiry_dates = sorted(work["Expiration"].dt.normalize().unique())
+       if not expiry_dates:
+           return empty
+
+       today = pd.Timestamp.now().normalize()
+       focus_expiry = next((d for d in expiry_dates if d >= today), expiry_dates[0])
+       focus_expiry = pd.Timestamp(focus_expiry)
+
+       focus_df = work[work["Expiration"].dt.normalize() == focus_expiry].copy()
+       if focus_df.empty:
+           return empty
+
+       focus_df["GEX_abs"] = focus_df["Gamma"] * (spot ** 2) * focus_df["Tit."]
+
+       call_frame = focus_df[
+           focus_df["Tipo"].str.upper().str.contains("CALL")
+       ].groupby("Strike", as_index=False).agg(GEX_customer=("GEX_abs", "sum"))
+
+       put_frame = focus_df[
+           focus_df["Tipo"].str.upper().str.contains("PUT")
+       ].groupby("Strike", as_index=False).agg(GEX_customer=("GEX_abs", "sum"))
+       put_frame["GEX_customer"] = -put_frame["GEX_customer"].abs()
+
+       lo = spot * (1.0 - zone_pct)
+       hi = spot * (1.0 + zone_pct)
+
+       resist = call_frame[
+           (call_frame["Strike"] >= spot) & (call_frame["Strike"] <= hi)
+       ].sort_values(["GEX_customer", "Strike"], ascending=[False, True]).head(top_n)
+
+       support = put_frame[
+           (put_frame["Strike"] <= spot) & (put_frame["Strike"] >= lo)
+       ].sort_values(["GEX_customer", "Strike"], ascending=[True, False]).head(top_n)
+
+       if resist.empty:
+           resist = call_frame.sort_values(["GEX_customer", "Strike"], ascending=[False, True]).head(top_n)
+       if support.empty:
+           support = put_frame.sort_values(["GEX_customer", "Strike"], ascending=[True, False]).head(top_n)
+
+       dte_val = int(np.nanmin(focus_df["DTE"])) if "DTE" in focus_df.columns and not focus_df["DTE"].isna().all() else np.nan
+
+       return {
+           "expiry_label": focus_expiry.strftime("%d/%m/%Y"),
+           "dte": dte_val,
+           "resist_zones": resist,
+           "support_zones": support,
+       }
+
+
+def _format_oi(value):
+       """Compact OI formatter for console tables."""
+       if value is None or not np.isfinite(value):
+           return "-"
+       return f"{int(round(float(value))):,}"
+
+
+def _strength_label(gex_value):
+       """Simple strength bucket for GEX zones."""
+       if gex_value is None or not np.isfinite(gex_value):
+           return "N/A"
+       gex_m = abs(float(gex_value)) / 1e6
+       if gex_m >= 100:
+           return "Strong"
+       if gex_m >= 20:
+           return "Mod"
+       return "Weak"
+
+
+def _build_pin_candidates_snapshot(df, spot, top_n=5, pct_range=0.05):
+       """
+       Build the top pin candidates near spot for the nearest available expiry.
+
+       Dealer GEX is the inverse of customer GEX; high positive dealer GEX near
+       spot tends to create a pinning effect as market makers hedge back toward
+       those strikes.
+       """
+       empty = {
+           "expiry_label": "N/A",
+           "dte": np.nan,
+           "pin_candidates": pd.DataFrame(),
+       }
+
+       if df is None or df.empty or "Expiration" not in df.columns or spot <= 0:
+           return empty
+
+       work = df.copy()
+       work["Expiration"] = pd.to_datetime(work["Expiration"], errors="coerce")
+       work = work.dropna(subset=["Expiration", "Strike", "Tit.", "Gamma"])
+       if work.empty:
+           return empty
+
+       expiry_dates = sorted(work["Expiration"].dt.normalize().unique())
+       if not expiry_dates:
+           return empty
+
+       today = pd.Timestamp.now().normalize()
+       focus_expiry = next((d for d in expiry_dates if d >= today), expiry_dates[0])
+       focus_expiry = pd.Timestamp(focus_expiry)
+
+       focus_df = work[work["Expiration"].dt.normalize() == focus_expiry].copy()
+       if focus_df.empty:
+           return empty
+
+       is_put = focus_df["Tipo"].str.upper().str.contains("PUT")
+       sign = np.where(is_put, -1.0, 1.0)
+       focus_df["GEX_customer"] = focus_df["Gamma"] * (spot ** 2) * focus_df["Tit."] * sign
+       focus_df["dealer_gex"] = -focus_df["GEX_customer"]
+       focus_df["call_oi"] = np.where(~is_put, focus_df["Tit."], 0.0)
+       focus_df["put_oi"] = np.where(is_put, focus_df["Tit."], 0.0)
+
+       lo = spot * (1.0 - pct_range)
+       hi = spot * (1.0 + pct_range)
+       near = focus_df[(focus_df["Strike"] >= lo) & (focus_df["Strike"] <= hi)]
+       if near.empty:
+           near = focus_df
+
+       pins = near.groupby("Strike", as_index=False).agg(
+           dealer_gex=("dealer_gex", "sum"),
+           call_oi=("call_oi", "sum"),
+           put_oi=("put_oi", "sum"),
+       )
+
+       pins = pins[pins["dealer_gex"] > 0].sort_values(
+           ["dealer_gex", "Strike"], ascending=[False, False]
+       ).head(top_n)
+
+       if pins.empty:
+           pins = near.groupby("Strike", as_index=False).agg(
+               dealer_gex=("dealer_gex", "sum"),
+               call_oi=("call_oi", "sum"),
+               put_oi=("put_oi", "sum"),
+           ).sort_values(["dealer_gex", "Strike"], ascending=[False, False]).head(top_n)
+
+       dte_val = int(np.nanmin(focus_df["DTE"])) if "DTE" in focus_df.columns and not focus_df["DTE"].isna().all() else np.nan
+
+       return {
+           "expiry_label": focus_expiry.strftime("%d/%m/%Y"),
+           "dte": dte_val,
+           "pin_candidates": pins,
+       }
+
+
+async def analyze_options(spot: float, underlying: str = "PETR4", show_plots: bool = False, win_mapper=None, output_dir: str = None):
        """
        Fetch options data from B3, compute Greeks via Black-Scholes, and analyze.
        Spot is passed as a parameter so the analysis aligns with current price.
@@ -198,8 +439,12 @@ async def analyze_options(spot: float, underlying: str = "PETR4", show_plots: bo
        print(f"Put  Wall: {put_wall:.2f}")
        print(f"Gamma Flip (approx): {gamma_flip:.2f}")
 
+       snapshot_path = None
+       if output_dir:
+           snapshot_path = os.path.join(output_dir, f"{underlying.lower()}_gex_snapshot_style.png")
+
        plot_gex_all_expiry(combined_gex, spot, underlying, gamma_flip,
-                          call_wall, put_wall, show_plots)
+                          call_wall, put_wall, show_plots, save_path=snapshot_path)
    
        # Extended Market Structure Metrics
        print("\n" + "="*75)
@@ -210,9 +455,9 @@ async def analyze_options(spot: float, underlying: str = "PETR4", show_plots: bo
        if 0.9 <= pcr_global <= 1.1:
            sentiment = "Neutral"
        elif pcr_global > 1.1:
-           sentiment = "Bearish — put demand dominates"
+           sentiment = "Bearish - put demand dominates"
        else:
-           sentiment = "Bullish — call demand dominates"
+           sentiment = "Bullish - call demand dominates"
        print(f"Sentiment:            {sentiment}")
    
        print("\nVolatility Skew:")
@@ -253,7 +498,7 @@ async def analyze_options(spot: float, underlying: str = "PETR4", show_plots: bo
                strategy = "Trend following, breakout trades, buy above gamma flip."
            else:
                regime = "TRANSITION ZONE"
-               rationale = "Market near flip — unstable hedging behavior."
+               rationale = "Market near flip - unstable hedging behavior."
                strategy = "Reduce size, use 5-min confirmation, neutral setups."
        else:
            regime, rationale, strategy = "UNKNOWN", "Gamma Flip not found", "N/A"
@@ -263,23 +508,74 @@ async def analyze_options(spot: float, underlying: str = "PETR4", show_plots: bo
        print(f"Rationale:    {rationale}")
        print(f"Recommended:  {strategy}")
    
-       # Significant GEX zones
-       print("\nSignificant GEX Zones:")
-       gex_sorted = gex_by_strike.sort_values("GEX_customer", ascending=False)
-       resist = gex_sorted.head(4)
-       supports = gex_sorted.tail(4)
-   
-       print("Support Zones (dealers short gamma on puts -> hedge-buying cushion):")
-       for _, r in supports.iterrows():
-           gex_mil = r["GEX_customer"] / 1e6
-           strength = "Strong" if abs(gex_mil) > 200 else "Moderate" if abs(gex_mil) > 100 else "Weak"
-           print(f"  Strike {r['Strike']:>8.2f} | {gex_mil:>7.2f}M | {strength}")
-   
-       print("\nResistance Zones (dealers long gamma -> counter-trend selling caps rallies):")
-       for _, r in resist.iterrows():
-           gex_mil = r["GEX_customer"] / 1e6
-           strength = "Strong" if abs(gex_mil) > 200 else "Moderate" if abs(gex_mil) > 100 else "Weak"
-           print(f"  Strike {r['Strike']:>8.2f} | +{gex_mil:>7.2f}M | {strength}")
+       # Significant GEX zones — dashboard-style support / resistance summary
+       zone_source = combined_gex.copy() if not combined_gex.empty else gex_by_strike.copy()
+       resist_zones, support_zones = _select_significant_zones(zone_source, spot, top_n=3, zone_pct=0.04)
+       focus_snapshot = _build_focus_expiry_snapshot(df, spot, top_n=3, zone_pct=0.04)
+       pin_snapshot = _build_pin_candidates_snapshot(df, spot, top_n=5, pct_range=0.05)
+       if not focus_snapshot['resist_zones'].empty or not focus_snapshot['support_zones'].empty:
+           resist_zones = focus_snapshot['resist_zones']
+           support_zones = focus_snapshot['support_zones']
+
+       flip_dist_pct = ((spot - gamma_flip) / gamma_flip * 100.0) if np.isfinite(gamma_flip) and gamma_flip != 0 else np.nan
+       sentiment_pt = _classify_sentiment_from_pcr(pcr_global)
+       hedging_state = _hedging_state(spot, gamma_flip)
+
+       print("\n" + "="*75)
+       print(f"GEX SNAPSHOT SUMMARY -- {underlying}")
+       print("="*75)
+       print(f"WALLS (C/P): {(f'{call_wall:.2f}' if np.isfinite(call_wall) else 'N/A')} / {(f'{put_wall:.2f}' if np.isfinite(put_wall) else 'N/A')}")
+       print(f"GAMMA FLIP : {gamma_flip:.2f}" if np.isfinite(gamma_flip) else "GAMMA FLIP : N/A")
+       print(f"PCR (OI)   : {pcr_global:.2f}")
+       print(f"SPOT       : {spot:.2f}")
+       print(f"SENTIMENTO : {sentiment_pt}")
+       print(f"IV SKEW    : {iv_skew:.2f}%")
+       print(f"REGIME     : {regime}")
+       print(f"FLIP DIST. : {flip_dist_pct:+.2f}%" if np.isfinite(flip_dist_pct) else "FLIP DIST. : N/A")
+       print(f"HEDGING    : {hedging_state}")
+       if focus_snapshot['expiry_label'] != 'N/A':
+           dte_label = f"{focus_snapshot['dte']} DTE" if np.isfinite(focus_snapshot['dte']) else "N/A"
+           print(f"FOCUS EXP. : {focus_snapshot['expiry_label']} ({dte_label})")
+
+       if not pin_snapshot['pin_candidates'].empty:
+           pin_dte_label = f"{pin_snapshot['dte']} DTE" if np.isfinite(pin_snapshot['dte']) else "N/A"
+           print("\nPIN CANDIDATES (+/-5% FROM SPOT) SNAPSHOT:")
+           print(f"Expiry: {pin_snapshot['expiry_label']} ({pin_dte_label})")
+           print(f"{'Strike':>10} {'Dealer GEX':>14} {'Calls OI':>12} {'Puts OI':>12}")
+           print("-" * 54)
+           for _, row in pin_snapshot['pin_candidates'].iterrows():
+               print(
+                   f"{row['Strike']:>10.2f} "
+                   f"{_format_gex_compact(row['dealer_gex']):>14} "
+                   f"{_format_oi(row['call_oi']):>12} "
+                   f"{_format_oi(row['put_oi']):>12}"
+               )
+
+       print("\nZONAS SIGNIFICATIVAS GEX:")
+       print(f"{'ZONA':<14} {'STRIKE':>10} {'GEX':>14} {'STRENGTH':>10}")
+       print("-" * 54)
+
+       if resist_zones.empty and support_zones.empty:
+           print(f"{'N/A':<14} {'-':>10} {'-':>14} {'-':>10}")
+       else:
+           for _, row in resist_zones.iterrows():
+               print(f"{'RESISTENCIA':<14} {row['Strike']:>10.2f} {_format_gex_compact(row['GEX_customer']):>14} {_strength_label(row['GEX_customer']):>10}")
+           for _, row in support_zones.iterrows():
+               print(f"{'SUPORTE':<14} {row['Strike']:>10.2f} {_format_gex_compact(row['GEX_customer']):>14} {_strength_label(row['GEX_customer']):>10}")
+
+       print("\nTOP 3 RESISTANCE ZONES:")
+       if resist_zones.empty:
+           print("  N/A")
+       else:
+           for idx, (_, row) in enumerate(resist_zones.reset_index(drop=True).iterrows(), start=1):
+               print(f"  {idx}. Strike {row['Strike']:.2f} | GEX {_format_gex_compact(row['GEX_customer'])}")
+
+       print("\nTOP 3 SUPPORT ZONES:")
+       if support_zones.empty:
+           print("  N/A")
+       else:
+           for idx, (_, row) in enumerate(support_zones.reset_index(drop=True).iterrows(), start=1):
+               print(f"  {idx}. Strike {row['Strike']:.2f} | GEX {_format_gex_compact(row['GEX_customer'])}")
    
        # Summary Snapshot
        # Helper to format BOVA11 + WIN$N side by side
@@ -355,6 +651,9 @@ async def main():
             except Exception as e2:
                 print(f"[!] Daily mapper also failed: {e2}")
 
+    output_dir = os.path.join(SCRIPT_DIR, "charts")
+    os.makedirs(output_dir, exist_ok=True)
+
     for asset in ASSET_SYMBOL:
         print(f"\n{'#'*80}\nAnalyzing {asset}...\n{'#'*80}")
         symbol_info = mt5_conn.get_symbol_info(asset)
@@ -367,6 +666,12 @@ async def main():
             continue
         print(f"Analyzing options data for {asset} with spot price {spot_price:.2f}...")
         mapper_for_asset = win_mapper if asset == "BOVA11" else None
-        await analyze_options(spot_price, asset, show_plots=True, win_mapper=mapper_for_asset)
+        await analyze_options(
+            spot_price,
+            asset,
+            show_plots=True,
+            win_mapper=mapper_for_asset,
+            output_dir=output_dir,
+        )
 
 asyncio.run(main())
