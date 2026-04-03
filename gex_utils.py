@@ -47,43 +47,36 @@ def compute_weekly_walls(df: pd.DataFrame, spot: float):
     df = df.copy()
     df['Expiration'] = pd.to_datetime(df['Expiration'])
 
-    # Determine the two target Fridays
-    current_friday = _friday_of_week(today)
-    if current_friday.date() < today.date():
-        # Friday already passed this week (Sat/Sun) — shift to next week
-        current_friday = _friday_of_week(today, weeks_ahead=1)
-    next_friday = current_friday + timedelta(weeks=1)
-
     # All available expiration dates, sorted
     all_expirations = sorted(df['Expiration'].dt.date.unique())
 
-    weeks = [
-        ("Current Week", current_friday),
-        ("Next Week",    next_friday),
-    ]
+    # Pick the two nearest expirations >= today (B3 options don't always
+    # expire on Fridays, so we use the actual dates from the data).
+    future_expirations = [d for d in all_expirations if d >= today.date()]
+    if not future_expirations:
+        # Everything already expired — use the last two available dates
+        future_expirations = all_expirations[-2:] if len(all_expirations) >= 2 else all_expirations
 
-    used_dates = set()
+    this_week_date = future_expirations[0] if future_expirations else None
+    next_week_date = future_expirations[1] if len(future_expirations) >= 2 else None
+
+    weeks = []
+    if this_week_date is not None:
+        weeks.append(("This Week", datetime.combine(this_week_date, datetime.min.time())))
+    if next_week_date is not None:
+        weeks.append(("Next Week", datetime.combine(next_week_date, datetime.min.time())))
+
     results = []
-    for label, friday in weeks:
-        target_date = friday.date()
+    for label, expiry_dt in weeks:
+        target_date = expiry_dt.date()
         wk_df = df[df['Expiration'].dt.date == target_date]
-
-        # If no options on this Friday, pick the next available expiration
-        if wk_df.empty:
-            candidates = [d for d in all_expirations
-                          if d > (current_friday.date() if label == "Next Week" else today.date())
-                          and d not in used_dates]
-            if candidates:
-                target_date = candidates[0]
-                friday = datetime.combine(target_date, datetime.min.time())
-                wk_df = df[df['Expiration'].dt.date == target_date]
 
         if wk_df.empty:
             results.append({
                 'label': label,
-                'friday_date': friday,
-                'friday_str': friday.strftime('%Y-%m-%d'),
-                'dte': _business_days_between(today, friday),
+                'friday_date': expiry_dt,
+                'friday_str': expiry_dt.strftime('%Y-%m-%d'),
+                'dte': _business_days_between(today, expiry_dt),
                 'calls': pd.DataFrame(),
                 'puts': pd.DataFrame(),
                 'gex_by_strike': pd.DataFrame(),
@@ -94,8 +87,6 @@ def compute_weekly_walls(df: pd.DataFrame, spot: float):
                 'put_wall': np.nan,
             })
             continue
-
-        used_dates.add(target_date)
 
         wk_calls = wk_df[wk_df['Tipo'].str.upper().str.contains('CALL')]
         wk_puts  = wk_df[wk_df['Tipo'].str.upper().str.contains('PUT')]
@@ -122,9 +113,9 @@ def compute_weekly_walls(df: pd.DataFrame, spot: float):
 
         results.append({
             'label': label,
-            'friday_date': friday,
-            'friday_str': friday.strftime('%Y-%m-%d'),
-            'dte': _business_days_between(today, friday),
+            'friday_date': expiry_dt,
+            'friday_str': expiry_dt.strftime('%Y-%m-%d'),
+            'dte': _business_days_between(today, expiry_dt),
             'calls': wk_calls,
             'puts': wk_puts,
             'gex_by_strike': gex_by_strike,
