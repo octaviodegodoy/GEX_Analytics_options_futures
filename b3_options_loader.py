@@ -21,10 +21,12 @@ from di1_rate_curve import get_rate_for_date, FALLBACK_RATE
 # Resolve paths so get_b3_data is importable
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(SCRIPT_DIR)
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
+    sys.path.insert(1, PARENT_DIR)
 
-from get_b3_data import fetch_b3_historical_file, fetch_open_interest
+from get_b3_data import fetch_b3_historical_file, fetch_open_interest, search_b3_historical_file
 
 
 def load_b3_options_data(underlying, spot, date=None):
@@ -34,6 +36,9 @@ def load_b3_options_data(underlying, spot, date=None):
         Ticker, Tipo, Strike, Ultimo, IV, Delta, Gamma, Tit., VolFin
     """
     raw = fetch_b3_historical_file(date)
+    if raw.empty:
+        print("[*] Primary fetch returned no data — searching recent business days...")
+        raw = search_b3_historical_file(max_attempts=7)
     if raw.empty:
         return pd.DataFrame()
 
@@ -142,4 +147,32 @@ def load_b3_options_data(underlying, spot, date=None):
     print(f"[*] Built chain: {len(df)} records ({calls_n} calls, {puts_n} puts)")
     print(f"   DTE distribution: {dict(dte_dist.head(5))}")
     print(f"   GEX weight: {'OI' if 'volume' not in oi_source else 'Volume (OI proxy)'}")
+
+    # ---- Filter to only the 2 next expiring dates for GEX analysis ----
+    today = pd.Timestamp.now().normalize()
+    df['Expiration'] = pd.to_datetime(df['Expiration'])
+    all_expirations = sorted(df['Expiration'].dt.normalize().unique())
+    future_expirations = [d for d in all_expirations if d >= today]
+    if not future_expirations:
+        future_expirations = all_expirations[-2:] if len(all_expirations) >= 2 else all_expirations
+
+    next_2 = future_expirations[:2]
+
+    if next_2:
+        df = df[df['Expiration'].dt.normalize().isin(next_2)].copy()
+
+    print(f"\n[*] 2 NEXT EXPIRING DATES for GEX analysis:")
+    for i, exp in enumerate(next_2, 1):
+        exp_ts = pd.Timestamp(exp)
+        dte = max(int(np.busday_count(today.date(), exp_ts.date())), 0)
+        n_opts = len(df[df['Expiration'].dt.normalize() == exp_ts])
+        n_calls = len(df[(df['Expiration'].dt.normalize() == exp_ts) & (df['Tipo'] == 'CALL')])
+        n_puts = len(df[(df['Expiration'].dt.normalize() == exp_ts) & (df['Tipo'] == 'PUT')])
+        print(f"   {i}. {exp_ts.strftime('%Y-%m-%d')} ({dte} BD) — {n_opts} contracts ({n_calls}C / {n_puts}P)")
+    if len(next_2) == 0:
+        print("   No future expirations found in data!")
+
+    total_after = len(df)
+    print(f"[*] Filtered chain: {total_after} records (kept 2 nearest expirations only)")
+
     return df

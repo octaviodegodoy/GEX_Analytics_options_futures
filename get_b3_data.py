@@ -15,14 +15,46 @@ CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".b3_cache"
 
 
 def get_previous_business_day() -> str:
-    """Get previous business day in YYYY-MM-DD format."""
+    """Get the most recent business day (today if weekday, else last Friday)."""
     d = datetime.now()
-    # Go back to previous day
-    d -= timedelta(days=1)
     # Skip weekends
     while d.weekday() >= 5:  # 5=Saturday, 6=Sunday
         d -= timedelta(days=1)
     return d.strftime('%Y-%m-%d')
+
+
+def _get_nth_previous_business_day(n: int) -> str:
+    """Get the n-th previous business day (0 = today/latest, 1 = yesterday, etc.)."""
+    d = datetime.now()
+    # First, land on today or the most recent weekday
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    count = 0
+    while count < n:
+        d -= timedelta(days=1)
+        if d.weekday() < 5:
+            count += 1
+    return d.strftime('%Y-%m-%d')
+
+
+def search_b3_historical_file(max_attempts: int = 7) -> pd.DataFrame:
+    """
+    Search backwards through recent business days to find an available
+    B3 COTAHIST historical file.  Tries up to *max_attempts* business days.
+
+    Returns the first non-empty DataFrame found, or an empty DataFrame
+    if none of the dates had data.
+    """
+    for i in range(max_attempts):
+        date = _get_nth_previous_business_day(i)
+        print(f"[>] Searching B3 historical file: attempt {i+1}/{max_attempts} — {date}")
+        df = fetch_b3_historical_file(date)
+        if not df.empty:
+            print(f"[OK] Found valid B3 data for {date} ({len(df)} option records)")
+            return df
+        print(f"   [–] No data for {date}, trying next business day...")
+    print(f"[X] No B3 historical file found in the last {max_attempts} business days")
+    return pd.DataFrame()
 
 
 # ============================================================
@@ -529,7 +561,7 @@ def fetch_multiday_volume(
 
     all_records = []
     dates_fetched = 0
-    d = datetime.now() - timedelta(days=1)
+    d = datetime.now()
 
     while dates_fetched < num_days:
         # Skip weekends

@@ -2,7 +2,6 @@
 """
 GEX Plot Functions — all matplotlib charting for GEX analytics.
 """
-import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -92,7 +91,7 @@ def plot_gex_friday(fri_gex_by_strike, spot, underlying, next_friday_str,
 
 
 def plot_gex_all_expiry(gex_by_strike, spot, underlying, gamma_flip,
-                        call_wall, put_wall, show_plots=False, save_path=None):
+                        call_wall, put_wall, show_plots=False):
     """Render a dark SPX-style GEX snapshot for B3 assets."""
     if gex_by_strike is None or gex_by_strike.empty:
         print(f"[!] No GEX data to plot for {underlying} - skipping snapshot chart.")
@@ -217,21 +216,17 @@ def plot_gex_all_expiry(gex_by_strike, spot, underlying, gamma_flip,
 
     plt.tight_layout(rect=[0, 0.04, 1, 0.95])
 
-    if save_path:
-        save_dir = os.path.dirname(save_path)
-        if save_dir:
-            os.makedirs(save_dir, exist_ok=True)
-        fig.savefig(save_path, dpi=160, bbox_inches='tight', facecolor=fig.get_facecolor())
-        print(f"[OK] Saved GEX snapshot chart: {save_path}")
-
     if show_plots:
         plt.show()
     plt.close(fig)
 
 
-def plot_gex_weekly(weekly_results, spot, underlying, show_plots=False):
+def plot_gex_weekly(weekly_results, spot, underlying, show_plots=False,
+                    pin_candidates=None, resist_zones=None, support_zones=None,
+                    win_mapper=None):
     """
-    Side-by-side bar charts of GEX for current-week and next-week expirations.
+    Side-by-side bar charts of GEX for current-week and next-week expirations,
+    with pin candidates and support/resistance zones annotated.
 
     Parameters
     ----------
@@ -243,26 +238,51 @@ def plot_gex_weekly(weekly_results, spot, underlying, show_plots=False):
         Ticker label for chart titles.
     show_plots : bool
         If False, suppress plt.show().
+    pin_candidates : pd.DataFrame or None
+        Top pin candidates with 'Strike' and 'dealer_gex' columns.
+    resist_zones : pd.DataFrame or None
+        Top resistance zones with 'Strike' and 'GEX_customer' columns.
+    support_zones : pd.DataFrame or None
+        Top support zones with 'Strike' and 'GEX_customer' columns.
+    win_mapper : KalmanPriceMapper or None
+        If provided, WIN$N equivalents are shown alongside BOVA11 prices.
     """
     n_panels = len([w for w in weekly_results if not w['gex_by_strike'].empty])
     if n_panels == 0:
         return
 
-    fig, axes = plt.subplots(1, n_panels, figsize=(14 * n_panels / 2, 6),
-                             squeeze=False)
-    axes = axes.ravel()
-    panel = 0
+    # --- layout: GEX panels on top row, annotation table on bottom ---
+    has_table = (pin_candidates is not None or resist_zones is not None
+                 or support_zones is not None)
+    if has_table:
+        fig = plt.figure(figsize=(max(16, 9 * n_panels), 12), facecolor="#05070B")
+        gs = fig.add_gridspec(2, n_panels, height_ratios=[3, 1.2], hspace=0.35)
+    else:
+        fig = plt.figure(figsize=(max(16, 9 * n_panels), 8), facecolor="#05070B")
+        gs = fig.add_gridspec(1, n_panels)
 
+    panel = 0
     for wk in weekly_results:
         gex_df = wk['gex_by_strike']
         if gex_df.empty:
             continue
 
-        ax = axes[panel]
+        ax = fig.add_subplot(gs[0, panel])
+        ax.set_facecolor("#05070B")
         ax.set_axisbelow(True)
 
         strikes = gex_df['Strike'].to_numpy(dtype=float)
         gvals = (gex_df['GEX_customer'] / 1e6).to_numpy(dtype=float)
+
+        # Keep only the 10 strikes above and 10 below spot
+        sorted_strikes = np.sort(np.unique(strikes))
+        below = sorted_strikes[sorted_strikes <= spot][-10:]
+        above = sorted_strikes[sorted_strikes > spot][:10]
+        visible = np.concatenate([below, above])
+        if len(visible) > 0:
+            mask = np.isin(strikes, visible)
+            strikes = strikes[mask]
+            gvals = gvals[mask]
 
         u = np.unique(strikes)
         if len(u) >= 3:
@@ -272,17 +292,23 @@ def plot_gex_weekly(weekly_results, spot, underlying, show_plots=False):
         else:
             bw = 0.1
 
-        colors = np.where(gvals >= 0, "#10B981", "#EF4444")
+        colors = np.where(gvals >= 0, "#2DD4BF", "#EF4444")
         ax.bar(strikes, gvals, width=bw, color=colors,
-               edgecolor="none", alpha=0.6, zorder=3)
+               edgecolor="none", alpha=0.7, zorder=3)
 
         if len(gvals) > 2:
             sm = pd.Series(gvals).rolling(3, center=True, min_periods=1).mean().values
             ax.plot(strikes, sm, color='#3B82F6', lw=2, zorder=4,
                     label='Smoothed GEX')
 
-        ax.axvline(spot, color='green', lw=1.2, zorder=5,
-                   label=f'Spot: {spot:.2f}')
+        # Helper: format price with optional WIN$N equivalent
+        def _wlbl(val):
+            if win_mapper is not None:
+                return f"{val:.2f} (WIN {win_mapper.bova11_to_ind(val):,.0f})"
+            return f"{val:.2f}"
+
+        ax.axvline(spot, color='#F9FAFB', lw=1.4, ls=(0, (4, 4)), zorder=5,
+                   label=f'Spot: {_wlbl(spot)}')
 
         flip = wk['gamma_flip']
         cw = wk['call_wall']
@@ -290,42 +316,99 @@ def plot_gex_weekly(weekly_results, spot, underlying, show_plots=False):
 
         if np.isfinite(flip):
             ax.axvline(flip, color='#F59E0B', lw=1.2, ls='--', zorder=5,
-                       label=f"Flip: {flip:.2f}")
+                       label=f"Flip: {_wlbl(flip)}")
         if np.isfinite(cw):
-            ax.axvline(cw, color='#2563EB', ls=':', lw=1.6,
-                       label=f"Call Wall: {cw:.2f}")
-            ax.annotate(f"Call Wall\n{cw:.2f}",
-                        xy=(cw, ax.get_ylim()[1] if ax.get_ylim()[1] != 0 else 1),
-                        xytext=(8, -18), textcoords='offset points',
-                        fontsize=9, fontweight='bold', color='#2563EB',
-                        bbox=dict(boxstyle='round,pad=0.3', fc='white',
-                                  ec='#2563EB', alpha=0.85),
-                        ha='left', va='top')
+            ax.axvline(cw, color='#2563EB', ls=':', lw=1.6, zorder=5,
+                       label=f"Call Wall: {_wlbl(cw)}")
         if np.isfinite(pw):
-            ax.axvline(pw, color='#DC2626', ls='--', lw=1.6,
-                       label=f"Put Wall: {pw:.2f}")
-            ax.annotate(f"Put Wall\n{pw:.2f}",
-                        xy=(pw, ax.get_ylim()[0] if ax.get_ylim()[0] != 0 else -1),
-                        xytext=(-8, 18), textcoords='offset points',
-                        fontsize=9, fontweight='bold', color='#DC2626',
-                        bbox=dict(boxstyle='round,pad=0.3', fc='white',
-                                  ec='#DC2626', alpha=0.85),
-                        ha='right', va='bottom')
+            ax.axvline(pw, color='#DC2626', ls='--', lw=1.6, zorder=5,
+                       label=f"Put Wall: {_wlbl(pw)}")
 
-        cw_s = f"{cw:.2f}" if np.isfinite(cw) else "N/A"
-        pw_s = f"{pw:.2f}" if np.isfinite(pw) else "N/A"
+        # Mark pin candidates as diamonds
+        if pin_candidates is not None and not pin_candidates.empty:
+            pin_strikes = pin_candidates['Strike'].values
+            for ps in pin_strikes:
+                ax.axvline(ps, color='#A855F7', lw=0.8, ls=':', alpha=0.6, zorder=4)
+            ax.plot([], [], color='#A855F7', ls=':', lw=0.8, label='Pin Candidates')
+
+        # Mark resistance zones as up-triangles
+        if resist_zones is not None and not resist_zones.empty:
+            for _, rz in resist_zones.iterrows():
+                ax.axvline(rz['Strike'], color='#60A5FA', lw=0.9, ls='-.', alpha=0.5, zorder=4)
+            ax.plot([], [], color='#60A5FA', ls='-.', lw=0.9, label='Resistance')
+
+        # Mark support zones as down-triangles
+        if support_zones is not None and not support_zones.empty:
+            for _, sz in support_zones.iterrows():
+                ax.axvline(sz['Strike'], color='#FB923C', lw=0.9, ls='-.', alpha=0.5, zorder=4)
+            ax.plot([], [], color='#FB923C', ls='-.', lw=0.9, label='Support')
+
+        cw_s = _wlbl(cw) if np.isfinite(cw) else "N/A"
+        pw_s = _wlbl(pw) if np.isfinite(pw) else "N/A"
         ax.set_title(
             f"{underlying} — {wk['label']} ({wk['friday_str']}, {wk['dte']} BD)\n"
             f"Call Wall: {cw_s}  |  Put Wall: {pw_s}",
-            fontsize=11, fontweight='bold')
-        ax.set_xlabel('Strike Price')
-        ax.set_ylabel('GEX (millions)')
-        ax.yaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.2f}"))
-        ax.legend(loc='upper right', fontsize=8, framealpha=0.9)
-        ax.grid(alpha=0.25)
+            fontsize=11, fontweight='bold', color='#F9FAFB')
+        ax.set_xlabel('Strike Price', color='#F3F4F6', fontsize=10)
+        ax.set_ylabel('GEX (millions)', color='#F3F4F6', fontsize=10)
+        ax.yaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.0f}"))
+        ax.tick_params(colors='#E5E7EB', labelsize=9)
+        for spine in ax.spines.values():
+            spine.set_color('#111827')
+        ax.axhline(0, color='#6B7280', lw=0.7, alpha=0.6, zorder=2)
+        ax.grid(axis='y', color='#1F2937', alpha=0.6, linewidth=0.5)
+
+        # Set x-axis to visible strike range with padding
+        if len(visible) > 0:
+            pad = bw * 2
+            ax.set_xlim(visible.min() - pad, visible.max() + pad)
+
+        ax.legend(loc='upper right', fontsize=7, framealpha=0.9,
+                  facecolor='#0B1220', edgecolor='#1F2937', labelcolor='#E5E7EB')
         panel += 1
 
-    plt.tight_layout()
+    # --- Bottom annotation table ---
+    if has_table:
+        ax_tbl = fig.add_subplot(gs[1, :])
+        ax_tbl.set_facecolor("#05070B")
+        ax_tbl.axis('off')
+
+        def _tbl_strike(val):
+            if win_mapper is not None:
+                return f"Strike {val:.2f} (WIN {win_mapper.bova11_to_ind(val):,.0f})"
+            return f"Strike {val:.2f}"
+
+        lines = []
+        if pin_candidates is not None and not pin_candidates.empty:
+            lines.append(("PIN CANDIDATES", "#A855F7"))
+            for _, r in pin_candidates.head(5).iterrows():
+                lines.append((f"  {_tbl_strike(r['Strike'])}  |  Dealer GEX {r['dealer_gex']/1e9:.1f}B"
+                              f"  |  C-OI {int(r['call_oi']):,}  |  P-OI {int(r['put_oi']):,}",
+                              "#D8B4FE"))
+        if resist_zones is not None and not resist_zones.empty:
+            lines.append(("RESISTANCE ZONES", "#60A5FA"))
+            for _, r in resist_zones.head(3).iterrows():
+                lines.append((f"  {_tbl_strike(r['Strike'])}  |  GEX {r['GEX_customer']/1e9:.1f}B",
+                              "#93C5FD"))
+        if support_zones is not None and not support_zones.empty:
+            lines.append(("SUPPORT ZONES", "#FB923C"))
+            for _, r in support_zones.head(3).iterrows():
+                lines.append((f"  {_tbl_strike(r['Strike'])}  |  GEX {r['GEX_customer']/1e9:.1f}B",
+                              "#FDBA74"))
+
+        y_pos = 0.95
+        step = 0.065
+        for text, color in lines:
+            fontsize = 10 if not text.startswith("  ") else 9
+            weight = 'bold' if not text.startswith("  ") else 'normal'
+            ax_tbl.text(0.02, y_pos, text, transform=ax_tbl.transAxes,
+                        fontsize=fontsize, fontweight=weight, color=color,
+                        fontfamily='monospace', va='top')
+            y_pos -= step
+
+    fig.suptitle(f"{underlying} — Weekly GEX Analysis", fontsize=14,
+                 fontweight='bold', color='#F9FAFB', y=0.98)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     if show_plots:
         plt.show()
     plt.close(fig)

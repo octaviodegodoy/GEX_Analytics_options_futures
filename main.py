@@ -38,10 +38,12 @@ import asyncio
 # Ensure parent dir is on sys.path for mt5_connector / get_b3_data
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(SCRIPT_DIR)
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 if PARENT_DIR not in sys.path:
-    sys.path.insert(0, PARENT_DIR)
+    sys.path.insert(1, PARENT_DIR)
 
-from constants import ASSET_SYMBOL
+from constants import ASSET_SYMBOL, PLOT_GEX
 from gex_utils import find_gamma_flip, compute_weekly_walls
 from gex_plots import plot_notional_by_strike, plot_gex_all_expiry, plot_gex_weekly
 from b3_options_loader import load_b3_options_data
@@ -128,10 +130,10 @@ def _select_significant_zones(gex_frame, spot, top_n=3, zone_pct=0.04):
 
 def _build_focus_expiry_snapshot(df, spot, top_n=3, zone_pct=0.04):
        """
-       Build a support / resistance view for the nearest available expiration.
+       Build a support / resistance view for the 2 nearest available expirations.
 
-       This is used only for the console snapshot table so the printed zones can
-       mirror the image-style "Venc. DD/MM" summary more closely.
+       Uses all options in the DataFrame (which is already filtered to the
+       2 next expiring dates by the loader).
        """
        empty = {
            "expiry_label": "N/A",
@@ -154,10 +156,12 @@ def _build_focus_expiry_snapshot(df, spot, top_n=3, zone_pct=0.04):
            return empty
 
        today = pd.Timestamp.now().normalize()
-       focus_expiry = next((d for d in expiry_dates if d >= today), expiry_dates[0])
-       focus_expiry = pd.Timestamp(focus_expiry)
+       future_expiries = [d for d in expiry_dates if d >= today]
+       if not future_expiries:
+           future_expiries = expiry_dates[-2:] if len(expiry_dates) >= 2 else expiry_dates
+       focus_expiries = future_expiries[:2]
 
-       focus_df = work[work["Expiration"].dt.normalize() == focus_expiry].copy()
+       focus_df = work[work["Expiration"].dt.normalize().isin(focus_expiries)].copy()
        if focus_df.empty:
            return empty
 
@@ -189,9 +193,10 @@ def _build_focus_expiry_snapshot(df, spot, top_n=3, zone_pct=0.04):
            support = put_frame.sort_values(["GEX_customer", "Strike"], ascending=[True, False]).head(top_n)
 
        dte_val = int(np.nanmin(focus_df["DTE"])) if "DTE" in focus_df.columns and not focus_df["DTE"].isna().all() else np.nan
+       expiry_label = " + ".join(pd.Timestamp(d).strftime("%d/%m/%Y") for d in focus_expiries)
 
        return {
-           "expiry_label": focus_expiry.strftime("%d/%m/%Y"),
+           "expiry_label": expiry_label,
            "dte": dte_val,
            "resist_zones": resist,
            "support_zones": support,
@@ -219,7 +224,7 @@ def _strength_label(gex_value):
 
 def _build_pin_candidates_snapshot(df, spot, top_n=5, pct_range=0.05):
        """
-       Build the top pin candidates near spot for the nearest available expiry.
+       Build the top pin candidates near spot for the 2 nearest expirations.
 
        Dealer GEX is the inverse of customer GEX; high positive dealer GEX near
        spot tends to create a pinning effect as market makers hedge back toward
@@ -245,10 +250,12 @@ def _build_pin_candidates_snapshot(df, spot, top_n=5, pct_range=0.05):
            return empty
 
        today = pd.Timestamp.now().normalize()
-       focus_expiry = next((d for d in expiry_dates if d >= today), expiry_dates[0])
-       focus_expiry = pd.Timestamp(focus_expiry)
+       future_expiries = [d for d in expiry_dates if d >= today]
+       if not future_expiries:
+           future_expiries = expiry_dates[-2:] if len(expiry_dates) >= 2 else expiry_dates
+       focus_expiries = future_expiries[:2]
 
-       focus_df = work[work["Expiration"].dt.normalize() == focus_expiry].copy()
+       focus_df = work[work["Expiration"].dt.normalize().isin(focus_expiries)].copy()
        if focus_df.empty:
            return empty
 
@@ -283,19 +290,79 @@ def _build_pin_candidates_snapshot(df, spot, top_n=5, pct_range=0.05):
            ).sort_values(["dealer_gex", "Strike"], ascending=[False, False]).head(top_n)
 
        dte_val = int(np.nanmin(focus_df["DTE"])) if "DTE" in focus_df.columns and not focus_df["DTE"].isna().all() else np.nan
+       expiry_label = " + ".join(pd.Timestamp(d).strftime("%d/%m/%Y") for d in focus_expiries)
 
        return {
-           "expiry_label": focus_expiry.strftime("%d/%m/%Y"),
+           "expiry_label": expiry_label,
            "dte": dte_val,
            "pin_candidates": pins,
        }
 
 
-async def analyze_options(spot: float, underlying: str = "PETR4", show_plots: bool = False, win_mapper=None, output_dir: str = None):
+def _export_gex_csv(underlying, spot, call_wall, put_wall, gamma_flip, regime,
+                    weekly_results, pin_snapshot, resist_zones, support_zones,
+                    win_mapper):
+       """Write GEX levels to MQL5/Files/GEX_<underlying>.csv for the MT5 indicator."""
+       # Resolve MQL5/Files path relative to SCRIPT_DIR
+       mql5_root = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..'))
+       files_dir = os.path.join(mql5_root, 'Files')
+       os.makedirs(files_dir, exist_ok=True)
+       csv_path = os.path.join(files_dir, f'GEX_{underlying}.csv')
+
+       def _win(val):
+           """Return WIN$N equivalent or empty string."""
+           if win_mapper is not None and np.isfinite(val):
+               return f"{win_mapper.bova11_to_ind(val):.0f}"
+           return ""
+
+       rows = []
+       rows.append(("spot", f"{spot:.4f}", _win(spot), ""))
+       rows.append(("call_wall", f"{call_wall:.4f}" if np.isfinite(call_wall) else "", _win(call_wall) if np.isfinite(call_wall) else "", ""))
+       rows.append(("put_wall", f"{put_wall:.4f}" if np.isfinite(put_wall) else "", _win(put_wall) if np.isfinite(put_wall) else "", ""))
+       rows.append(("gamma_flip", f"{gamma_flip:.4f}" if np.isfinite(gamma_flip) else "", _win(gamma_flip) if np.isfinite(gamma_flip) else "", ""))
+       rows.append(("regime", "1" if "POSITIVE" in regime else ("-1" if "NEGATIVE" in regime else "0"), "", ""))
+
+       # Per-week walls
+       for wk in weekly_results:
+           if wk['gex_by_strike'].empty:
+               continue
+           tag = wk['label'].lower().replace(' ', '_')  # current_week / next_week
+           exp = wk['friday_str']
+           cw = wk['call_wall']
+           pw = wk['put_wall']
+           fl = wk['gamma_flip']
+           rows.append((f"{tag}_call_wall", f"{cw:.4f}" if np.isfinite(cw) else "", _win(cw) if np.isfinite(cw) else "", exp))
+           rows.append((f"{tag}_put_wall", f"{pw:.4f}" if np.isfinite(pw) else "", _win(pw) if np.isfinite(pw) else "", exp))
+           rows.append((f"{tag}_flip", f"{fl:.4f}" if np.isfinite(fl) else "", _win(fl) if np.isfinite(fl) else "", exp))
+
+       # Pin candidates
+       pins = pin_snapshot.get('pin_candidates', pd.DataFrame())
+       if not pins.empty:
+           for i, (_, r) in enumerate(pins.head(5).iterrows(), 1):
+               rows.append((f"pin_{i}", f"{r['Strike']:.4f}", _win(r['Strike']), ""))
+
+       # Resistance zones
+       if not resist_zones.empty:
+           for i, (_, r) in enumerate(resist_zones.head(3).iterrows(), 1):
+               rows.append((f"resist_{i}", f"{r['Strike']:.4f}", _win(r['Strike']), ""))
+
+       # Support zones
+       if not support_zones.empty:
+           for i, (_, r) in enumerate(support_zones.head(3).iterrows(), 1):
+               rows.append((f"support_{i}", f"{r['Strike']:.4f}", _win(r['Strike']), ""))
+
+       with open(csv_path, 'w', newline='') as f:
+           f.write("key,value,win,expiry\n")
+           for key, val, win, exp in rows:
+               f.write(f"{key},{val},{win},{exp}\n")
+
+       print(f"\n[CSV] Exported → {csv_path}")
+
+
+async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=None):
        """
        Fetch options data from B3, compute Greeks via Black-Scholes, and analyze.
        Spot is passed as a parameter so the analysis aligns with current price.
-       If show_plots is False, all matplotlib charts are suppressed.
        win_mapper: KalmanPriceMapper for converting BOVA11 levels to WIN$N (only for BOVA11).
        """
 
@@ -362,7 +429,6 @@ async def analyze_options(spot: float, underlying: str = "PETR4", show_plots: bo
        # NOTIONAL (volume financeiro por strike)
        # ------------------------------------------------------------
        vol_by_strike = df.groupby(['Strike','Tipo'])['VolFin'].sum().unstack(fill_value=0)
-       plot_notional_by_strike(vol_by_strike, spot, underlying, show_plots)
 
        # ------------------------------------------------------------
        # GAMMA EXPOSURE (Customer)  —  Dollar Gamma = bs_gamma × S² × OI
@@ -403,8 +469,6 @@ async def analyze_options(spot: float, underlying: str = "PETR4", show_plots: bo
            if np.isfinite(wk['put_wall']):
                print(f"    Put Wall:   {wk['put_wall']:.2f}")
 
-       plot_gex_weekly(weekly_results, spot, underlying, show_plots)
-
        # Combined Call/Put Walls — current + next week expirations only
        combined_wk_dfs = [wk['gex_by_strike'] for wk in weekly_results if not wk['gex_by_strike'].empty]
        if combined_wk_dfs:
@@ -439,13 +503,6 @@ async def analyze_options(spot: float, underlying: str = "PETR4", show_plots: bo
        print(f"Put  Wall: {put_wall:.2f}")
        print(f"Gamma Flip (approx): {gamma_flip:.2f}")
 
-       snapshot_path = None
-       if output_dir:
-           snapshot_path = os.path.join(output_dir, f"{underlying.lower()}_gex_snapshot_style.png")
-
-       plot_gex_all_expiry(combined_gex, spot, underlying, gamma_flip,
-                          call_wall, put_wall, show_plots, save_path=snapshot_path)
-   
        # Extended Market Structure Metrics
        print("\n" + "="*75)
        print("EXTENDED MARKET STRUCTURE METRICS -- STOCK TRACE-Lite View")
@@ -524,10 +581,17 @@ async def analyze_options(spot: float, underlying: str = "PETR4", show_plots: bo
        print("\n" + "="*75)
        print(f"GEX SNAPSHOT SUMMARY -- {underlying}")
        print("="*75)
-       print(f"WALLS (C/P): {(f'{call_wall:.2f}' if np.isfinite(call_wall) else 'N/A')} / {(f'{put_wall:.2f}' if np.isfinite(put_wall) else 'N/A')}")
-       print(f"GAMMA FLIP : {gamma_flip:.2f}" if np.isfinite(gamma_flip) else "GAMMA FLIP : N/A")
+       if win_mapper is not None:
+           cw_win = f" (WIN$N {win_mapper.bova11_to_ind(call_wall):,.0f})" if np.isfinite(call_wall) else ""
+           pw_win = f" (WIN$N {win_mapper.bova11_to_ind(put_wall):,.0f})" if np.isfinite(put_wall) else ""
+           flip_win = f" (WIN$N {win_mapper.bova11_to_ind(gamma_flip):,.0f})" if np.isfinite(gamma_flip) else ""
+           spot_win = f" (WIN$N {win_mapper.bova11_to_ind(spot):,.0f})"
+       else:
+           cw_win = pw_win = flip_win = spot_win = ""
+       print(f"WALLS (C/P): {(f'{call_wall:.2f}' if np.isfinite(call_wall) else 'N/A')}{cw_win} / {(f'{put_wall:.2f}' if np.isfinite(put_wall) else 'N/A')}{pw_win}")
+       print(f"GAMMA FLIP : {gamma_flip:.2f}{flip_win}" if np.isfinite(gamma_flip) else "GAMMA FLIP : N/A")
        print(f"PCR (OI)   : {pcr_global:.2f}")
-       print(f"SPOT       : {spot:.2f}")
+       print(f"SPOT       : {spot:.2f}{spot_win}")
        print(f"SENTIMENTO : {sentiment_pt}")
        print(f"IV SKEW    : {iv_skew:.2f}%")
        print(f"REGIME     : {regime}")
@@ -541,41 +605,55 @@ async def analyze_options(spot: float, underlying: str = "PETR4", show_plots: bo
            pin_dte_label = f"{pin_snapshot['dte']} DTE" if np.isfinite(pin_snapshot['dte']) else "N/A"
            print("\nPIN CANDIDATES (+/-5% FROM SPOT) SNAPSHOT:")
            print(f"Expiry: {pin_snapshot['expiry_label']} ({pin_dte_label})")
-           print(f"{'Strike':>10} {'Dealer GEX':>14} {'Calls OI':>12} {'Puts OI':>12}")
-           print("-" * 54)
+           if win_mapper is not None:
+               print(f"{'Strike':>10} {'WIN$N':>10} {'Dealer GEX':>14} {'Calls OI':>12} {'Puts OI':>12}")
+               print("-" * 66)
+           else:
+               print(f"{'Strike':>10} {'Dealer GEX':>14} {'Calls OI':>12} {'Puts OI':>12}")
+               print("-" * 54)
            for _, row in pin_snapshot['pin_candidates'].iterrows():
+               win_str = f"{win_mapper.bova11_to_ind(row['Strike']):>10,.0f} " if win_mapper is not None else ""
                print(
                    f"{row['Strike']:>10.2f} "
+                   f"{win_str}"
                    f"{_format_gex_compact(row['dealer_gex']):>14} "
                    f"{_format_oi(row['call_oi']):>12} "
                    f"{_format_oi(row['put_oi']):>12}"
                )
 
        print("\nZONAS SIGNIFICATIVAS GEX:")
-       print(f"{'ZONA':<14} {'STRIKE':>10} {'GEX':>14} {'STRENGTH':>10}")
-       print("-" * 54)
+       if win_mapper is not None:
+           print(f"{'ZONA':<14} {'STRIKE':>10} {'WIN$N':>10} {'GEX':>14} {'STRENGTH':>10}")
+           print("-" * 66)
+       else:
+           print(f"{'ZONA':<14} {'STRIKE':>10} {'GEX':>14} {'STRENGTH':>10}")
+           print("-" * 54)
 
        if resist_zones.empty and support_zones.empty:
            print(f"{'N/A':<14} {'-':>10} {'-':>14} {'-':>10}")
        else:
            for _, row in resist_zones.iterrows():
-               print(f"{'RESISTENCIA':<14} {row['Strike']:>10.2f} {_format_gex_compact(row['GEX_customer']):>14} {_strength_label(row['GEX_customer']):>10}")
+               win_str = f" {win_mapper.bova11_to_ind(row['Strike']):>10,.0f}" if win_mapper is not None else ""
+               print(f"{'RESISTENCIA':<14} {row['Strike']:>10.2f}{win_str} {_format_gex_compact(row['GEX_customer']):>14} {_strength_label(row['GEX_customer']):>10}")
            for _, row in support_zones.iterrows():
-               print(f"{'SUPORTE':<14} {row['Strike']:>10.2f} {_format_gex_compact(row['GEX_customer']):>14} {_strength_label(row['GEX_customer']):>10}")
+               win_str = f" {win_mapper.bova11_to_ind(row['Strike']):>10,.0f}" if win_mapper is not None else ""
+               print(f"{'SUPORTE':<14} {row['Strike']:>10.2f}{win_str} {_format_gex_compact(row['GEX_customer']):>14} {_strength_label(row['GEX_customer']):>10}")
 
        print("\nTOP 3 RESISTANCE ZONES:")
        if resist_zones.empty:
            print("  N/A")
        else:
            for idx, (_, row) in enumerate(resist_zones.reset_index(drop=True).iterrows(), start=1):
-               print(f"  {idx}. Strike {row['Strike']:.2f} | GEX {_format_gex_compact(row['GEX_customer'])}")
+               win_str = f" (WIN$N {win_mapper.bova11_to_ind(row['Strike']):,.0f})" if win_mapper is not None else ""
+               print(f"  {idx}. Strike {row['Strike']:.2f}{win_str} | GEX {_format_gex_compact(row['GEX_customer'])}")
 
        print("\nTOP 3 SUPPORT ZONES:")
        if support_zones.empty:
            print("  N/A")
        else:
            for idx, (_, row) in enumerate(support_zones.reset_index(drop=True).iterrows(), start=1):
-               print(f"  {idx}. Strike {row['Strike']:.2f} | GEX {_format_gex_compact(row['GEX_customer'])}")
+               win_str = f" (WIN$N {win_mapper.bova11_to_ind(row['Strike']):,.0f})" if win_mapper is not None else ""
+               print(f"  {idx}. Strike {row['Strike']:.2f}{win_str} | GEX {_format_gex_compact(row['GEX_customer'])}")
    
        # Summary Snapshot
        # Helper to format BOVA11 + WIN$N side by side
@@ -629,6 +707,25 @@ async def analyze_options(spot: float, underlying: str = "PETR4", show_plots: bo
        print(f"\nMarket Regime: {regime}")
        print("="*75)
 
+       # ----------------------------------------------------------------
+       # Export CSV for MQL5 indicator  →  MQL5/Files/GEX_<underlying>.csv
+       # ----------------------------------------------------------------
+       _export_gex_csv(
+           underlying, spot, call_wall, put_wall, gamma_flip, regime,
+           weekly_results, pin_snapshot, resist_zones, support_zones,
+           win_mapper,
+       )
+
+       if PLOT_GEX:
+           plot_gex_weekly(
+               weekly_results, spot, underlying,
+               pin_candidates=pin_snapshot['pin_candidates'] if not pin_snapshot['pin_candidates'].empty else None,
+               resist_zones=resist_zones if not resist_zones.empty else None,
+               support_zones=support_zones if not support_zones.empty else None,
+               win_mapper=win_mapper,
+               show_plots=True,
+           )
+
 async def main():
     mt5_conn = MT5Connector()
 
@@ -651,9 +748,6 @@ async def main():
             except Exception as e2:
                 print(f"[!] Daily mapper also failed: {e2}")
 
-    output_dir = os.path.join(SCRIPT_DIR, "charts")
-    os.makedirs(output_dir, exist_ok=True)
-
     for asset in ASSET_SYMBOL:
         print(f"\n{'#'*80}\nAnalyzing {asset}...\n{'#'*80}")
         symbol_info = mt5_conn.get_symbol_info(asset)
@@ -669,9 +763,7 @@ async def main():
         await analyze_options(
             spot_price,
             asset,
-            show_plots=True,
             win_mapper=mapper_for_asset,
-            output_dir=output_dir,
         )
 
 asyncio.run(main())
