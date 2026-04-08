@@ -202,3 +202,133 @@ def find_gamma_flip(df_options, spot, grid_step=0.25, pct_range=0.15):
 
     # No crossing — return price with smallest |net GEX|
     return float(price_grid[np.argmin(np.abs(net_gex))])
+
+
+def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
+                                proximity_pct=0.005):
+    """
+    Generate actionable trade signals based on GEX levels.
+
+    Logic
+    -----
+    **Buy signal** (bounce from put wall in negative gamma):
+        1. Spot < gamma_flip  →  negative gamma regime (amplified volatility)
+        2. Spot within ``proximity_pct`` of put wall  →  near dealer support
+
+    **Sell signal** (rejection at call wall in positive gamma):
+        1. Spot > gamma_flip  →  positive gamma regime (dampened, mean-reverting)
+        2. Spot within ``proximity_pct`` of call wall  →  near dealer resistance
+
+    **Breakout warning** (spot below put wall in negative gamma):
+        Spot broke through dealer support — trend continuation expected,
+        do NOT buy the bounce.
+
+    Parameters
+    ----------
+    spot : float
+    gamma_flip, call_wall, put_wall : float
+        GEX key levels (may be ``np.nan``).
+    proximity_pct : float
+        How close spot must be to a wall to trigger a signal (default 0.5 %).
+
+    Returns
+    -------
+    dict
+        signal : str   — "BUY", "SELL", "BREAKOUT_DOWN", "BREAKOUT_UP", or "NEUTRAL"
+        regime : str   — "NEGATIVE_GAMMA", "POSITIVE_GAMMA", or "TRANSITION"
+        reason : str   — human-readable explanation
+        strength : int — 0 (no signal) to 3 (strongest conviction)
+    """
+    result = {
+        'signal': 'NEUTRAL',
+        'regime': 'UNKNOWN',
+        'reason': 'Insufficient data for signal generation.',
+        'strength': 0,
+    }
+
+    if not np.isfinite(gamma_flip) or gamma_flip == 0:
+        return result
+
+    # --- Regime ---
+    flip_dist_pct = (spot - gamma_flip) / gamma_flip
+    if flip_dist_pct > 0.005:
+        result['regime'] = 'POSITIVE_GAMMA'
+    elif flip_dist_pct < -0.005:
+        result['regime'] = 'NEGATIVE_GAMMA'
+    else:
+        result['regime'] = 'TRANSITION'
+        result['reason'] = (
+            f'Spot ({spot:.2f}) within 0.5% of gamma flip ({gamma_flip:.2f}). '
+            'Unstable zone — reduce size, wait for confirmation.'
+        )
+        result['strength'] = 0
+        return result
+
+    has_put_wall = np.isfinite(put_wall)
+    has_call_wall = np.isfinite(call_wall)
+
+    # --- Negative gamma: look for buy at put wall or breakout ---
+    if result['regime'] == 'NEGATIVE_GAMMA' and has_put_wall:
+        dist_to_pw = (spot - put_wall) / put_wall if put_wall != 0 else np.nan
+
+        if np.isfinite(dist_to_pw) and dist_to_pw < -proximity_pct:
+            # Spot broke below put wall → breakout continuation
+            result['signal'] = 'BREAKOUT_DOWN'
+            result['reason'] = (
+                f'Spot ({spot:.2f}) broke below put wall ({put_wall:.2f}) '
+                f'in negative gamma. Trend continuation expected — avoid longs.'
+            )
+            result['strength'] = 3
+        elif np.isfinite(dist_to_pw) and abs(dist_to_pw) <= proximity_pct:
+            # Spot near put wall → buy bounce setup
+            result['signal'] = 'BUY'
+            result['reason'] = (
+                f'Spot ({spot:.2f}) near put wall ({put_wall:.2f}) in '
+                f'negative gamma (flip at {gamma_flip:.2f}). '
+                'Dealers short gamma — high-probability bounce zone. '
+                'Confirm with 15-min reversal candle / volume spike.'
+            )
+            result['strength'] = 2
+        else:
+            # Below flip but not near put wall yet
+            result['signal'] = 'NEUTRAL'
+            result['reason'] = (
+                f'Negative gamma regime (spot {spot:.2f} < flip {gamma_flip:.2f}) '
+                f'but spot not yet at put wall ({put_wall:.2f}). Wait for approach.'
+            )
+            result['strength'] = 1
+
+    # --- Positive gamma: look for sell at call wall or breakout ---
+    elif result['regime'] == 'POSITIVE_GAMMA' and has_call_wall:
+        dist_to_cw = (spot - call_wall) / call_wall if call_wall != 0 else np.nan
+
+        if np.isfinite(dist_to_cw) and dist_to_cw > proximity_pct:
+            # Spot broke above call wall → breakout continuation
+            result['signal'] = 'BREAKOUT_UP'
+            result['reason'] = (
+                f'Spot ({spot:.2f}) broke above call wall ({call_wall:.2f}) '
+                f'in positive gamma. Gamma squeeze potential — trend continuation.'
+            )
+            result['strength'] = 3
+        elif np.isfinite(dist_to_cw) and abs(dist_to_cw) <= proximity_pct:
+            # Spot near call wall → sell / mean-reversion setup
+            result['signal'] = 'SELL'
+            result['reason'] = (
+                f'Spot ({spot:.2f}) near call wall ({call_wall:.2f}) in '
+                f'positive gamma (flip at {gamma_flip:.2f}). '
+                'Dealers long gamma — mean-reversion rejection likely. '
+                'Confirm with 15-min rejection wick / volume drop.'
+            )
+            result['strength'] = 2
+        else:
+            result['signal'] = 'NEUTRAL'
+            result['reason'] = (
+                f'Positive gamma regime (spot {spot:.2f} > flip {gamma_flip:.2f}) '
+                f'but spot not yet at call wall ({call_wall:.2f}). Range-trade setup.'
+            )
+            result['strength'] = 1
+
+    else:
+        result['reason'] = 'Missing wall data for signal generation.'
+
+    return result

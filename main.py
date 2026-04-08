@@ -44,9 +44,10 @@ if PARENT_DIR not in sys.path:
     sys.path.insert(1, PARENT_DIR)
 
 from constants import ASSET_SYMBOL, PLOT_GEX
-from gex_utils import find_gamma_flip, compute_weekly_walls
+from gex_utils import find_gamma_flip, compute_weekly_walls, generate_gex_trade_signals
 from gex_plots import plot_notional_by_strike, plot_gex_all_expiry, plot_gex_weekly
 from b3_options_loader import load_b3_options_data
+from flyagonal_strategy import build_flyagonal, format_flyagonal_snapshot
 from mt5_connector import MT5Connector
 from di1_rate_curve import build_di1_curve
 from kalman_price_mapper import build_ind_bova11_mapper, build_ind_bova11_mapper_intraday
@@ -301,7 +302,7 @@ def _build_pin_candidates_snapshot(df, spot, top_n=5, pct_range=0.05):
 
 def _export_gex_csv(underlying, spot, call_wall, put_wall, gamma_flip, regime,
                     weekly_results, pin_snapshot, resist_zones, support_zones,
-                    win_mapper):
+                    win_mapper, trade_signal=None, flyagonal=None):
        """Write GEX levels to MQL5/Files/GEX_<underlying>.csv for the MT5 indicator."""
        # Resolve MQL5/Files path relative to SCRIPT_DIR
        mql5_root = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..'))
@@ -351,12 +352,29 @@ def _export_gex_csv(underlying, spot, call_wall, put_wall, gamma_flip, regime,
            for i, (_, r) in enumerate(support_zones.head(3).iterrows(), 1):
                rows.append((f"support_{i}", f"{r['Strike']:.4f}", _win(r['Strike']), ""))
 
+       # Trade signal
+       if trade_signal is not None:
+           sig_map = {'BUY': '1', 'SELL': '-1', 'BREAKOUT_DOWN': '-2',
+                      'BREAKOUT_UP': '2', 'NEUTRAL': '0'}
+           rows.append(("signal", sig_map.get(trade_signal['signal'], '0'), "", ""))
+           rows.append(("signal_name", trade_signal['signal'], "", ""))
+           rows.append(("signal_strength", str(trade_signal['strength']), "", ""))
+           rows.append(("signal_regime", trade_signal['regime'], "", ""))
+
+       # Flyagonal strategy levels
+       if flyagonal is not None:
+           rows.append(("fly_center", f"{flyagonal['center_strike']:.4f}", _win(flyagonal['center_strike']), flyagonal['near_expiry']))
+           rows.append(("fly_lower", f"{flyagonal['lower_strike']:.4f}", _win(flyagonal['lower_strike']), flyagonal['far_expiry']))
+           rows.append(("fly_upper", f"{flyagonal['upper_strike']:.4f}", _win(flyagonal['upper_strike']), flyagonal['far_expiry']))
+           rows.append(("fly_net_premium", f"{flyagonal['net_premium']:.4f}", "", ""))
+           rows.append(("fly_suitability", flyagonal['suitability'], "", ""))
+
        with open(csv_path, 'w', newline='') as f:
            f.write("key,value,win,expiry\n")
            for key, val, win, exp in rows:
                f.write(f"{key},{val},{win},{exp}\n")
 
-       print(f"\n[CSV] Exported → {csv_path}")
+       print(f"\n[CSV] Exported -> {csv_path}")
 
 
 async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=None):
@@ -708,12 +726,50 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
        print("="*75)
 
        # ----------------------------------------------------------------
+       # GEX TRADE SIGNAL — regime + wall proximity
+       # ----------------------------------------------------------------
+       trade_signal = generate_gex_trade_signals(
+           spot, gamma_flip, call_wall, put_wall
+       )
+
+       signal_colors = {
+           'BUY': '',
+           'SELL': '',
+           'BREAKOUT_DOWN': '',
+           'BREAKOUT_UP': '',
+           'NEUTRAL': '',
+       }
+       RST = ''
+       sc = signal_colors.get(trade_signal['signal'], '')
+       strength_bar = '#' * trade_signal['strength'] + '.' * (3 - trade_signal['strength'])
+
+       print(f"\n{'='*75}")
+       print(f"GEX TRADE SIGNAL -- {underlying}")
+       print(f"{'='*75}")
+       print(f"  SIGNAL   : {sc}{trade_signal['signal']}{RST}  [{strength_bar}]")
+       print(f"  REGIME   : {trade_signal['regime']}")
+       print(f"  STRENGTH : {trade_signal['strength']}/3")
+       print(f"  REASON   : {trade_signal['reason']}")
+       print(f"{'='*75}")
+
+       # ----------------------------------------------------------------
+       # FLYAGONAL STRATEGY — Diagonal Butterfly from GEX levels
+       # ----------------------------------------------------------------
+       flyagonal = build_flyagonal(
+           df, spot, weekly_results, pin_snapshot, regime,
+           option_type='call',
+       )
+       print("\n" + format_flyagonal_snapshot(flyagonal, win_mapper=win_mapper))
+
+       # ----------------------------------------------------------------
        # Export CSV for MQL5 indicator  →  MQL5/Files/GEX_<underlying>.csv
        # ----------------------------------------------------------------
        _export_gex_csv(
            underlying, spot, call_wall, put_wall, gamma_flip, regime,
            weekly_results, pin_snapshot, resist_zones, support_zones,
            win_mapper,
+           trade_signal=trade_signal,
+           flyagonal=flyagonal,
        )
 
        if PLOT_GEX:
