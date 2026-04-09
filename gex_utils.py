@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 
+from constants import GEX_WALL_PROXIMITY_PCT
+
 
 def _friday_of_week(ref_date: datetime, weeks_ahead: int = 0) -> datetime:
     """Return the Friday of the week ``weeks_ahead`` from *ref_date*."""
@@ -205,7 +207,7 @@ def find_gamma_flip(df_options, spot, grid_step=0.25, pct_range=0.15):
 
 
 def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
-                                proximity_pct=0.015):
+                                proximity_pct=None):
     """
     Generate actionable trade signals based on GEX levels.
 
@@ -239,6 +241,9 @@ def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
         reason : str   — human-readable explanation
         strength : int — 0 (no signal) to 3 (strongest conviction)
     """
+    if proximity_pct is None:
+        proximity_pct = GEX_WALL_PROXIMITY_PCT
+
     result = {
         'signal': 'NEUTRAL',
         'regime': 'UNKNOWN',

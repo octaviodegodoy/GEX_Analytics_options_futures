@@ -45,7 +45,7 @@ if PARENT_DIR not in sys.path:
 
 from constants import ASSET_SYMBOL, PLOT_GEX
 from constants import GEX_SEND_ORDERS, GEX_ORDER_VOLUME, GEX_ORDER_DEVIATION, GEX_MIN_SIGNAL_STRENGTH
-from constants import GEX_MONITOR_INTERVAL, GEX_MONITOR_ENABLED, GEX_MAGIC_NUMBER
+from constants import GEX_MONITOR_INTERVAL, GEX_MONITOR_ENABLED, GEX_MAGIC_NUMBER, GEX_WALL_PROXIMITY_PCT
 from gex_utils import find_gamma_flip, compute_weekly_walls, generate_gex_trade_signals
 from gex_plots import plot_notional_by_strike, plot_gex_all_expiry, plot_gex_weekly
 from b3_options_loader import load_b3_options_data
@@ -372,8 +372,8 @@ def _export_gex_csv(underlying, spot, call_wall, put_wall, gamma_flip, regime,
            rows.append(("fly_net_premium", f"{flyagonal['net_premium']:.4f}", "", ""))
            rows.append(("fly_suitability", flyagonal['suitability'], "", ""))
 
-       # Entry lines — 1.5% proximity zone from walls (matches generate_gex_trade_signals)
-       proximity_pct = 0.015
+       # Entry lines — proximity zone from walls (matches generate_gex_trade_signals)
+       proximity_pct = GEX_WALL_PROXIMITY_PCT
        if np.isfinite(call_wall) and call_wall > 0:
            entry_sell = call_wall * (1.0 - proximity_pct)
            rows.append(("entry_sell", f"{entry_sell:.4f}", _win(entry_sell), ""))
@@ -774,7 +774,7 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
        # ----------------------------------------------------------------
        # GEX ENTRY LEVELS — compute proximity zone for monitoring
        # ----------------------------------------------------------------
-       proximity_pct = 0.015
+       proximity_pct = GEX_WALL_PROXIMITY_PCT
        entry_sell = call_wall * (1.0 - proximity_pct) if np.isfinite(call_wall) and call_wall > 0 else np.nan
        entry_buy  = put_wall * (1.0 + proximity_pct)  if np.isfinite(put_wall) and put_wall > 0 else np.nan
 
@@ -841,7 +841,7 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
     import MetaTrader5 as _mt5
     from datetime import datetime as _dt
 
-    proximity_pct = 0.015
+    proximity_pct = GEX_WALL_PROXIMITY_PCT
     entry_buy_bova  = put_wall * (1.0 + proximity_pct) if np.isfinite(put_wall) and put_wall > 0 else np.nan
     entry_sell_bova = call_wall * (1.0 - proximity_pct) if np.isfinite(call_wall) and call_wall > 0 else np.nan
 
