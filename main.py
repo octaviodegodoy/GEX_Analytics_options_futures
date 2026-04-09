@@ -45,6 +45,7 @@ if PARENT_DIR not in sys.path:
 
 from constants import ASSET_SYMBOL, PLOT_GEX
 from constants import GEX_SEND_ORDERS, GEX_ORDER_VOLUME, GEX_ORDER_DEVIATION, GEX_MIN_SIGNAL_STRENGTH
+from constants import GEX_MONITOR_INTERVAL, GEX_MONITOR_ENABLED, GEX_MAGIC_NUMBER
 from gex_utils import find_gamma_flip, compute_weekly_walls, generate_gex_trade_signals
 from gex_plots import plot_notional_by_strike, plot_gex_all_expiry, plot_gex_weekly
 from b3_options_loader import load_b3_options_data
@@ -771,50 +772,19 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
        print(f"{'='*75}")
 
        # ----------------------------------------------------------------
-       # GEX PENDING ORDERS — place limit orders on WIN futures
+       # GEX ENTRY LEVELS — compute proximity zone for monitoring
        # ----------------------------------------------------------------
        proximity_pct = 0.015
        entry_sell = call_wall * (1.0 - proximity_pct) if np.isfinite(call_wall) and call_wall > 0 else np.nan
        entry_buy  = put_wall * (1.0 + proximity_pct)  if np.isfinite(put_wall) and put_wall > 0 else np.nan
 
-       if GEX_SEND_ORDERS and mt5_conn is not None and win_symbol:
-           import MetaTrader5 as _mt5
-
-           # Cancel previous GEX pending orders for this symbol
-           n_cancelled = mt5_conn.cancel_gex_pending_orders(symbol=win_symbol)
-           if n_cancelled:
-               print(f"[GEX] Cancelled {n_cancelled} stale pending order(s) on {win_symbol}")
-
-           sig = trade_signal['signal']
-           strength = trade_signal['strength']
-
-           if strength >= GEX_MIN_SIGNAL_STRENGTH:
-               if sig == 'BUY' and np.isfinite(entry_buy) and win_mapper is not None:
-                   win_entry_buy = win_mapper.bova11_to_ind(entry_buy)
-                   mt5_conn.place_pending_order(
-                       symbol=win_symbol,
-                       order_type=_mt5.ORDER_TYPE_BUY_LIMIT,
-                       volume=GEX_ORDER_VOLUME,
-                       price=win_entry_buy,
-                       deviation=GEX_ORDER_DEVIATION,
-                       comment=f"GEX BUY PutWall {put_wall:.2f}",
-                   )
-               elif sig == 'SELL' and np.isfinite(entry_sell) and win_mapper is not None:
-                   win_entry_sell = win_mapper.bova11_to_ind(entry_sell)
-                   mt5_conn.place_pending_order(
-                       symbol=win_symbol,
-                       order_type=_mt5.ORDER_TYPE_SELL_LIMIT,
-                       volume=GEX_ORDER_VOLUME,
-                       price=win_entry_sell,
-                       deviation=GEX_ORDER_DEVIATION,
-                       comment=f"GEX SELL CallWall {call_wall:.2f}",
-                   )
-               else:
-                   print(f"[GEX] Signal '{sig}' — no pending order (wall entries only for BUY/SELL)")
-           else:
-               print(f"[GEX] Signal strength {strength}/3 < min {GEX_MIN_SIGNAL_STRENGTH} — skipping order")
-       elif GEX_SEND_ORDERS and not win_symbol:
-           print(f"[GEX] Orders enabled but no WIN symbol resolved — skipping")
+       if win_mapper is not None:
+           _eb = f" (WIN {win_mapper.bova11_to_ind(entry_buy):.0f})" if np.isfinite(entry_buy) else ""
+           _es = f" (WIN {win_mapper.bova11_to_ind(entry_sell):.0f})" if np.isfinite(entry_sell) else ""
+       else:
+           _eb = _es = ""
+       print(f"\n  ENTRY BUY  : {f'{entry_buy:.2f}' if np.isfinite(entry_buy) else 'N/A'}{_eb}")
+       print(f"  ENTRY SELL : {f'{entry_sell:.2f}' if np.isfinite(entry_sell) else 'N/A'}{_es}")
 
        # ----------------------------------------------------------------
        # FLYAGONAL STRATEGY — Diagonal Butterfly from GEX levels
@@ -847,6 +817,127 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
                show_plots=True,
            )
 
+       # Return key GEX levels for the monitor
+       return {
+           'call_wall': call_wall,
+           'put_wall': put_wall,
+           'gamma_flip': gamma_flip,
+           'regime': regime,
+           'trade_signal': trade_signal,
+       }
+
+
+async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
+                                call_wall, put_wall, gamma_flip):
+    """
+    Real-time spot price monitor for GEX entry execution.
+
+    Polls WIN futures tick every GEX_MONITOR_INTERVAL seconds, re-evaluates
+    the trade signal with the current spot, and sends a market order when
+    a wall entry is triggered with sufficient signal strength.
+
+    Stops when both BUY and SELL sides have been executed, or on KeyboardInterrupt.
+    """
+    import MetaTrader5 as _mt5
+    from datetime import datetime as _dt
+
+    proximity_pct = 0.015
+    entry_buy_bova  = put_wall * (1.0 + proximity_pct) if np.isfinite(put_wall) and put_wall > 0 else np.nan
+    entry_sell_bova = call_wall * (1.0 - proximity_pct) if np.isfinite(call_wall) and call_wall > 0 else np.nan
+
+    win_entry_buy  = win_mapper.bova11_to_ind(entry_buy_bova) if np.isfinite(entry_buy_bova) else np.nan
+    win_entry_sell = win_mapper.bova11_to_ind(entry_sell_bova) if np.isfinite(entry_sell_bova) else np.nan
+
+    buy_executed  = False
+    sell_executed = False
+
+    print(f"\n{'='*75}")
+    print(f"GEX MONITOR STARTED — {win_symbol}")
+    print(f"{'='*75}")
+    print(f"  Call Wall  : {call_wall:.2f} (BOVA) → {win_mapper.bova11_to_ind(call_wall):.0f} (WIN)" if np.isfinite(call_wall) else "  Call Wall  : N/A")
+    print(f"  Put Wall   : {put_wall:.2f} (BOVA) → {win_mapper.bova11_to_ind(put_wall):.0f} (WIN)" if np.isfinite(put_wall) else "  Put Wall   : N/A")
+    print(f"  Gamma Flip : {gamma_flip:.2f} (BOVA) → {win_mapper.bova11_to_ind(gamma_flip):.0f} (WIN)" if np.isfinite(gamma_flip) else "  Gamma Flip : N/A")
+    print(f"  Entry BUY  : {entry_buy_bova:.2f} (BOVA) → {win_entry_buy:.0f} (WIN)" if np.isfinite(entry_buy_bova) else "  Entry BUY  : N/A")
+    print(f"  Entry SELL : {entry_sell_bova:.2f} (BOVA) → {win_entry_sell:.0f} (WIN)" if np.isfinite(entry_sell_bova) else "  Entry SELL : N/A")
+    print(f"  Volume     : {GEX_ORDER_VOLUME}")
+    print(f"  Interval   : {GEX_MONITOR_INTERVAL}s")
+    print(f"  Min Strength: {GEX_MIN_SIGNAL_STRENGTH}/3")
+    print(f"{'='*75}")
+    print(f"  Press Ctrl+C to stop monitoring.\n")
+
+    tick_count = 0
+    try:
+        while not (buy_executed and sell_executed):
+            tick = _mt5.symbol_info_tick(win_symbol)
+            if tick is None:
+                print(f"[GEX Monitor] Could not get tick for {win_symbol}")
+                await asyncio.sleep(GEX_MONITOR_INTERVAL)
+                continue
+
+            win_spot = (tick.bid + tick.ask) / 2.0
+            bova_spot = win_mapper.ind_to_bova11(win_spot)
+
+            signal = generate_gex_trade_signals(bova_spot, gamma_flip, call_wall, put_wall)
+            sig = signal['signal']
+            strength = signal['strength']
+            tick_count += 1
+
+            # Log every tick (10s) with compact status
+            ts = _dt.now().strftime("%H:%M:%S")
+            side_status = (("BUY:DONE" if buy_executed else "BUY:wait") + " | "
+                           + ("SELL:DONE" if sell_executed else "SELL:wait"))
+            print(f"[{ts}] {win_symbol} {win_spot:.0f} | BOVA {bova_spot:.2f} | "
+                  f"{sig} [{strength}/3] | {signal['regime']} | {side_status}")
+
+            # --- Execute BUY ---
+            if (sig == 'BUY' and strength >= GEX_MIN_SIGNAL_STRENGTH
+                    and not buy_executed and np.isfinite(win_entry_buy)):
+                print(f"\n[GEX Monitor] *** BUY TRIGGERED @ {tick.ask:.0f} ***")
+                result = mt5_conn.place_order(
+                    symbol=win_symbol,
+                    order_type=_mt5.ORDER_TYPE_BUY,
+                    volume=GEX_ORDER_VOLUME,
+                    price=tick.ask,
+                    deviation=GEX_ORDER_DEVIATION,
+                    comment=f"GEX BUY PutWall {put_wall:.2f}",
+                    magic=GEX_MAGIC_NUMBER,
+                )
+                if result is not None and hasattr(result, 'retcode') and result.retcode == _mt5.TRADE_RETCODE_DONE:
+                    buy_executed = True
+                    print(f"[GEX Monitor] BUY FILLED — order #{result.order}\n")
+                else:
+                    print(f"[GEX Monitor] BUY order sent (check logs above for status)\n")
+                    buy_executed = True  # Avoid repeated attempts on same tick
+
+            # --- Execute SELL ---
+            elif (sig == 'SELL' and strength >= GEX_MIN_SIGNAL_STRENGTH
+                      and not sell_executed and np.isfinite(win_entry_sell)):
+                print(f"\n[GEX Monitor] *** SELL TRIGGERED @ {tick.bid:.0f} ***")
+                result = mt5_conn.place_order(
+                    symbol=win_symbol,
+                    order_type=_mt5.ORDER_TYPE_SELL,
+                    volume=GEX_ORDER_VOLUME,
+                    price=tick.bid,
+                    deviation=GEX_ORDER_DEVIATION,
+                    comment=f"GEX SELL CallWall {call_wall:.2f}",
+                    magic=GEX_MAGIC_NUMBER,
+                )
+                if result is not None and hasattr(result, 'retcode') and result.retcode == _mt5.TRADE_RETCODE_DONE:
+                    sell_executed = True
+                    print(f"[GEX Monitor] SELL FILLED — order #{result.order}\n")
+                else:
+                    print(f"[GEX Monitor] SELL order sent (check logs above for status)\n")
+                    sell_executed = True
+
+            await asyncio.sleep(GEX_MONITOR_INTERVAL)
+
+    except KeyboardInterrupt:
+        print(f"\n[GEX Monitor] Stopped by user after {tick_count} ticks.")
+
+    print(f"[GEX Monitor] Session ended. BUY={'DONE' if buy_executed else 'PENDING'} | "
+          f"SELL={'DONE' if sell_executed else 'PENDING'}")
+
+
 async def main():
     mt5_conn = MT5Connector()
 
@@ -878,6 +969,7 @@ async def main():
             except Exception as e2:
                 print(f"[!] Daily mapper also failed: {e2}")
 
+    bova11_gex = None
     for asset in ASSET_SYMBOL:
         print(f"\n{'#'*80}\nAnalyzing {asset}...\n{'#'*80}")
         symbol_info = mt5_conn.get_symbol_info(asset)
@@ -891,12 +983,36 @@ async def main():
         print(f"Analyzing options data for {asset} with spot price {spot_price:.2f}...")
         mapper_for_asset = win_mapper if asset == "BOVA11" else None
         win_sym_for_asset = win_symbol if asset == "BOVA11" else ""
-        await analyze_options(
+        result = await analyze_options(
             spot_price,
             asset,
             win_mapper=mapper_for_asset,
             win_symbol=win_sym_for_asset,
             mt5_conn=mt5_conn,
         )
+        if asset == "BOVA11" and result is not None:
+            bova11_gex = result
+
+    # --- Start real-time GEX monitor on WIN futures ---
+    if (GEX_MONITOR_ENABLED and GEX_SEND_ORDERS
+            and bova11_gex is not None
+            and win_mapper is not None and win_symbol):
+        await _monitor_gex_entries(
+            mt5_conn, win_symbol, win_mapper,
+            call_wall=bova11_gex['call_wall'],
+            put_wall=bova11_gex['put_wall'],
+            gamma_flip=bova11_gex['gamma_flip'],
+        )
+    elif GEX_MONITOR_ENABLED:
+        reasons = []
+        if not GEX_SEND_ORDERS:
+            reasons.append("GEX_SEND_ORDERS is False")
+        if bova11_gex is None:
+            reasons.append("BOVA11 analysis failed or not in ASSET_SYMBOL")
+        if win_mapper is None:
+            reasons.append("WIN-BOVA11 mapper unavailable")
+        if not win_symbol:
+            reasons.append("WIN symbol not resolved")
+        print(f"\n[GEX Monitor] Cannot start: {'; '.join(reasons)}")
 
 asyncio.run(main())

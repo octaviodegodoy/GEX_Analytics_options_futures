@@ -33,7 +33,8 @@ class MT5Connector:
             df = df[df['time'].dt.weekday < 5]  # 0=Monday, ..., 4=Friday
             return df   
 
-    def place_order(self, symbol, order_type, volume, price, deviation, comment):
+    def place_order(self, symbol, order_type, volume, price, deviation, comment,
+                    magic=None):
         symbol_info = mt5.symbol_info(symbol)
         if symbol_info is None:
             print(f"Symbol {symbol} not found")
@@ -48,7 +49,7 @@ class MT5Connector:
             "sl": 0.0,
             "tp": 0.0,
             "deviation": deviation,
-            "magic": MAGIC_NUMBER,
+            "magic": magic if magic is not None else MAGIC_NUMBER,
             "comment": comment,
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
