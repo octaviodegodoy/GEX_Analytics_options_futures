@@ -13,6 +13,6 @@ GEX_SEND_ORDERS = True            # Set to True to enable order execution
 GEX_ORDER_VOLUME = 1.0             # Volume per order (mini contracts for WIN)
 GEX_ORDER_DEVIATION = 5            # Price deviation allowed (points)
 GEX_MIN_SIGNAL_STRENGTH = 2       # Minimum signal strength to place order (0-3)
-GEX_WALL_PROXIMITY_PCT = 0.01    # % distance from wall for entry zone (0.015 = 1.5%)
+GEX_WALL_PROXIMITY_PCT = 0.012    # % distance from wall for entry zone (0.015 = 1.5%)
 GEX_MONITOR_INTERVAL = 10         # Spot price poll interval in seconds
 GEX_MONITOR_ENABLED = True       # Set to True to start real-time GEX monitor after analysis
