@@ -205,7 +205,7 @@ def find_gamma_flip(df_options, spot, grid_step=0.25, pct_range=0.15):
 
 
 def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
-                                proximity_pct=0.005):
+                                proximity_pct=0.015):
     """
     Generate actionable trade signals based on GEX levels.
 

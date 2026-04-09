@@ -6,6 +6,7 @@ import time
 import pandas as pd
 
 from constants import CALL_OPTION, MAGIC_NUMBER, MIN_DAYS_TO_EXPIRY, PERIODS, SHIFT_PERIODS
+from constants import GEX_MAGIC_NUMBER
 
 class MT5Connector:
 
@@ -63,6 +64,113 @@ class MT5Connector:
                 print(f"Order executed successfully! Order: {result.order}, Deal: {result.deal}")
             else:
                 print(f"Order failed: {result.comment}")
+
+    def cancel_gex_pending_orders(self, symbol=None):
+        """Cancel all pending orders placed by GEX (identified by GEX_MAGIC_NUMBER).
+        If symbol is given, only cancel orders for that symbol."""
+        orders = mt5.orders_get()
+        if orders is None or len(orders) == 0:
+            return 0
+
+        cancelled = 0
+        for order in orders:
+            if order.magic != GEX_MAGIC_NUMBER:
+                continue
+            if symbol is not None and order.symbol != symbol:
+                continue
+
+            cancel_request = {
+                "action": mt5.TRADE_ACTION_REMOVE,
+                "order": order.ticket,
+            }
+            result = mt5.order_send(cancel_request)
+            if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                print(f"[GEX] Cancelled pending order #{order.ticket} "
+                      f"({order.symbol} {'BUY_LIMIT' if order.type == mt5.ORDER_TYPE_BUY_LIMIT else 'SELL_LIMIT'} "
+                      f"@ {order.price_open:.0f})")
+                cancelled += 1
+            else:
+                err = result.comment if result else mt5.last_error()
+                print(f"[GEX] Failed to cancel order #{order.ticket}: {err}")
+
+        return cancelled
+
+    def place_pending_order(self, symbol, order_type, volume, price, deviation, comment,
+                            sl=0.0, tp=0.0):
+        """Place a pending limit order (BUY_LIMIT or SELL_LIMIT).
+
+        Parameters
+        ----------
+        symbol : str        Target symbol (e.g. 'WINM26')
+        order_type : int    mt5.ORDER_TYPE_BUY_LIMIT or mt5.ORDER_TYPE_SELL_LIMIT
+        volume : float      Number of contracts
+        price : float       Limit price
+        deviation : int     Max allowed deviation in points
+        comment : str       Order comment
+        sl, tp : float      Stop-loss / take-profit (0 = none)
+
+        Returns
+        -------
+        result or None
+        """
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None:
+            print(f"[GEX] Symbol {symbol} not found")
+            return None
+
+        if not mt5.symbol_select(symbol, True):
+            print(f"[GEX] Failed to select symbol {symbol}")
+            return None
+
+        # Normalize price to symbol tick size
+        tick_size = symbol_info.trade_tick_size
+        if tick_size > 0:
+            price = round(round(price / tick_size) * tick_size, symbol_info.digits)
+
+        # Determine filling mode
+        filling = symbol_info.filling_mode
+        if filling & 2:
+            type_filling = mt5.ORDER_FILLING_FOK
+        elif filling & 1:
+            type_filling = mt5.ORDER_FILLING_IOC
+        else:
+            type_filling = mt5.ORDER_FILLING_RETURN
+
+        request = {
+            "action": mt5.TRADE_ACTION_PENDING,
+            "symbol": symbol,
+            "volume": float(volume),
+            "type": order_type,
+            "price": price,
+            "sl": sl,
+            "tp": tp,
+            "deviation": deviation,
+            "magic": GEX_MAGIC_NUMBER,
+            "comment": comment,
+            "type_time": mt5.ORDER_TIME_DAY,      # Expires end of day
+            "type_filling": type_filling,
+        }
+
+        # Pre-check
+        check = mt5.order_check(request)
+        if check is None:
+            print(f"[GEX] order_check failed for {symbol}, error: {mt5.last_error()}")
+            return None
+        if check.retcode != 0:
+            print(f"[GEX] order_check rejected: retcode={check.retcode}, {check.comment}")
+            return None
+
+        result = mt5.order_send(request)
+        if result is None:
+            print(f"[GEX] order_send failed, error: {mt5.last_error()}")
+        else:
+            type_str = "BUY_LIMIT" if order_type == mt5.ORDER_TYPE_BUY_LIMIT else "SELL_LIMIT"
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                print(f"[GEX] {type_str} placed: {symbol} {volume} @ {price:.0f}  "
+                      f"order #{result.order}")
+            else:
+                print(f"[GEX] {type_str} failed: {result.comment} (retcode={result.retcode})")
+        return result
 
     def place_order_vertical(self,symbolY,symbolX,orders_type,volume,iv_y,iv_x):
         print(f"Placing vertical order...{symbolY}, {symbolX}, {orders_type}, {volume}, {iv_y}, {iv_x}")

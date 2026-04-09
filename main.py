@@ -44,6 +44,7 @@ if PARENT_DIR not in sys.path:
     sys.path.insert(1, PARENT_DIR)
 
 from constants import ASSET_SYMBOL, PLOT_GEX
+from constants import GEX_SEND_ORDERS, GEX_ORDER_VOLUME, GEX_ORDER_DEVIATION, GEX_MIN_SIGNAL_STRENGTH
 from gex_utils import find_gamma_flip, compute_weekly_walls, generate_gex_trade_signals
 from gex_plots import plot_notional_by_strike, plot_gex_all_expiry, plot_gex_weekly
 from b3_options_loader import load_b3_options_data
@@ -302,7 +303,8 @@ def _build_pin_candidates_snapshot(df, spot, top_n=5, pct_range=0.05):
 
 def _export_gex_csv(underlying, spot, call_wall, put_wall, gamma_flip, regime,
                     weekly_results, pin_snapshot, resist_zones, support_zones,
-                    win_mapper, trade_signal=None, flyagonal=None):
+                    win_mapper, trade_signal=None, flyagonal=None,
+                    win_symbol=""):
        """Write GEX levels to MQL5/Files/GEX_<underlying>.csv for the MT5 indicator."""
        # Resolve MQL5/Files path relative to SCRIPT_DIR
        mql5_root = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..'))
@@ -311,7 +313,7 @@ def _export_gex_csv(underlying, spot, call_wall, put_wall, gamma_flip, regime,
        csv_path = os.path.join(files_dir, f'GEX_{underlying}.csv')
 
        def _win(val):
-           """Return WIN$N equivalent or empty string."""
+           """Return WIN current symbol equivalent or empty string."""
            if win_mapper is not None and np.isfinite(val):
                return f"{win_mapper.bova11_to_ind(val):.0f}"
            return ""
@@ -369,6 +371,19 @@ def _export_gex_csv(underlying, spot, call_wall, put_wall, gamma_flip, regime,
            rows.append(("fly_net_premium", f"{flyagonal['net_premium']:.4f}", "", ""))
            rows.append(("fly_suitability", flyagonal['suitability'], "", ""))
 
+       # Entry lines — 1.5% proximity zone from walls (matches generate_gex_trade_signals)
+       proximity_pct = 0.015
+       if np.isfinite(call_wall) and call_wall > 0:
+           entry_sell = call_wall * (1.0 - proximity_pct)
+           rows.append(("entry_sell", f"{entry_sell:.4f}", _win(entry_sell), ""))
+       if np.isfinite(put_wall) and put_wall > 0:
+           entry_buy = put_wall * (1.0 + proximity_pct)
+           rows.append(("entry_buy", f"{entry_buy:.4f}", _win(entry_buy), ""))
+
+       # Current WIN futures symbol name
+       if win_symbol:
+           rows.append(("win_symbol", win_symbol, "", ""))
+
        with open(csv_path, 'w', newline='') as f:
            f.write("key,value,win,expiry\n")
            for key, val, win, exp in rows:
@@ -377,11 +392,14 @@ def _export_gex_csv(underlying, spot, call_wall, put_wall, gamma_flip, regime,
        print(f"\n[CSV] Exported -> {csv_path}")
 
 
-async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=None):
+async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=None,
+                          win_symbol: str = "", mt5_conn=None):
        """
        Fetch options data from B3, compute Greeks via Black-Scholes, and analyze.
        Spot is passed as a parameter so the analysis aligns with current price.
-       win_mapper: KalmanPriceMapper for converting BOVA11 levels to WIN$N (only for BOVA11).
+       win_mapper: KalmanPriceMapper for converting BOVA11 levels to WIN current symbol (only for BOVA11).
+       win_symbol: current WIN futures contract name (e.g. "WINM26").
+       mt5_conn: MT5Connector instance for placing pending orders.
        """
 
        df = load_b3_options_data(underlying, spot)
@@ -753,6 +771,52 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
        print(f"{'='*75}")
 
        # ----------------------------------------------------------------
+       # GEX PENDING ORDERS — place limit orders on WIN futures
+       # ----------------------------------------------------------------
+       proximity_pct = 0.015
+       entry_sell = call_wall * (1.0 - proximity_pct) if np.isfinite(call_wall) and call_wall > 0 else np.nan
+       entry_buy  = put_wall * (1.0 + proximity_pct)  if np.isfinite(put_wall) and put_wall > 0 else np.nan
+
+       if GEX_SEND_ORDERS and mt5_conn is not None and win_symbol:
+           import MetaTrader5 as _mt5
+
+           # Cancel previous GEX pending orders for this symbol
+           n_cancelled = mt5_conn.cancel_gex_pending_orders(symbol=win_symbol)
+           if n_cancelled:
+               print(f"[GEX] Cancelled {n_cancelled} stale pending order(s) on {win_symbol}")
+
+           sig = trade_signal['signal']
+           strength = trade_signal['strength']
+
+           if strength >= GEX_MIN_SIGNAL_STRENGTH:
+               if sig == 'BUY' and np.isfinite(entry_buy) and win_mapper is not None:
+                   win_entry_buy = win_mapper.bova11_to_ind(entry_buy)
+                   mt5_conn.place_pending_order(
+                       symbol=win_symbol,
+                       order_type=_mt5.ORDER_TYPE_BUY_LIMIT,
+                       volume=GEX_ORDER_VOLUME,
+                       price=win_entry_buy,
+                       deviation=GEX_ORDER_DEVIATION,
+                       comment=f"GEX BUY PutWall {put_wall:.2f}",
+                   )
+               elif sig == 'SELL' and np.isfinite(entry_sell) and win_mapper is not None:
+                   win_entry_sell = win_mapper.bova11_to_ind(entry_sell)
+                   mt5_conn.place_pending_order(
+                       symbol=win_symbol,
+                       order_type=_mt5.ORDER_TYPE_SELL_LIMIT,
+                       volume=GEX_ORDER_VOLUME,
+                       price=win_entry_sell,
+                       deviation=GEX_ORDER_DEVIATION,
+                       comment=f"GEX SELL CallWall {call_wall:.2f}",
+                   )
+               else:
+                   print(f"[GEX] Signal '{sig}' — no pending order (wall entries only for BUY/SELL)")
+           else:
+               print(f"[GEX] Signal strength {strength}/3 < min {GEX_MIN_SIGNAL_STRENGTH} — skipping order")
+       elif GEX_SEND_ORDERS and not win_symbol:
+           print(f"[GEX] Orders enabled but no WIN symbol resolved — skipping")
+
+       # ----------------------------------------------------------------
        # FLYAGONAL STRATEGY — Diagonal Butterfly from GEX levels
        # ----------------------------------------------------------------
        flyagonal = build_flyagonal(
@@ -770,6 +834,7 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
            win_mapper,
            trade_signal=trade_signal,
            flyagonal=flyagonal,
+           win_symbol=win_symbol,
        )
 
        if PLOT_GEX:
@@ -790,7 +855,16 @@ async def main():
 
     # Build Kalman mapper WIN$N <-> BOVA11 on 15-min bars (best for intraday)
     win_mapper = None
+    win_symbol = ""
     if "BOVA11" in ASSET_SYMBOL:
+        # Resolve the current WIN mini futures contract (e.g. WINM26)
+        try:
+            _exp_time, win_symbol = mt5_conn.get_symbol_futures("*WIN*")
+            print(f"[i] Current WIN futures contract: {win_symbol}")
+        except Exception as e:
+            print(f"[!] Could not resolve current WIN symbol: {e}")
+            win_symbol = ""
+
         try:
             win_mapper = build_ind_bova11_mapper_intraday(
                 mt5_conn, ind_symbol="WIN$N", bova11_symbol="BOVA11"
@@ -816,10 +890,13 @@ async def main():
             continue
         print(f"Analyzing options data for {asset} with spot price {spot_price:.2f}...")
         mapper_for_asset = win_mapper if asset == "BOVA11" else None
+        win_sym_for_asset = win_symbol if asset == "BOVA11" else ""
         await analyze_options(
             spot_price,
             asset,
             win_mapper=mapper_for_asset,
+            win_symbol=win_sym_for_asset,
+            mt5_conn=mt5_conn,
         )
 
 asyncio.run(main())
