@@ -34,7 +34,7 @@ class MT5Connector:
             return df   
 
     def place_order(self, symbol, order_type, volume, price, deviation, comment,
-                    magic=None):
+                    magic=None, sl=0.0, tp=0.0):
         symbol_info = mt5.symbol_info(symbol)
         if symbol_info is None:
             print(f"Symbol {symbol} not found")
@@ -46,8 +46,8 @@ class MT5Connector:
             "volume": volume,
             "type": order_type,
             "price": price,
-            "sl": 0.0,
-            "tp": 0.0,
+            "sl": sl,
+            "tp": tp,
             "deviation": deviation,
             "magic": magic if magic is not None else MAGIC_NUMBER,
             "comment": comment,

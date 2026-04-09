@@ -46,6 +46,8 @@ if PARENT_DIR not in sys.path:
 from constants import ASSET_SYMBOL, PLOT_GEX
 from constants import GEX_SEND_ORDERS, GEX_ORDER_VOLUME, GEX_ORDER_DEVIATION, GEX_MIN_SIGNAL_STRENGTH
 from constants import GEX_MONITOR_INTERVAL, GEX_MONITOR_ENABLED, GEX_MAGIC_NUMBER, GEX_WALL_PROXIMITY_PCT
+from constants import GEX_MARGIN_FREE_PCT, GEX_SL_RISK_PCT, GEX_TRAILING_ACTIVATION_PCT
+from constants import GEX_DCA_LOSS_STEP_PCT, GEX_DCA_MAX_ORDERS
 from gex_utils import find_gamma_flip, compute_weekly_walls, generate_gex_trade_signals
 from gex_plots import plot_notional_by_strike, plot_gex_all_expiry, plot_gex_weekly
 from b3_options_loader import load_b3_options_data
@@ -851,6 +853,10 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
     buy_executed  = False
     sell_executed = False
 
+    # Trailing stop state per side: {entry_price, volume, best_price, trailing_active, position_ticket}
+    trail_buy  = None
+    trail_sell = None
+
     print(f"\n{'='*75}")
     print(f"GEX MONITOR STARTED — {win_symbol}")
     print(f"{'='*75}")
@@ -867,7 +873,13 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
 
     tick_count = 0
     try:
-        while not (buy_executed and sell_executed):
+        while True:
+            # Stop when both sides executed and no open GEX positions remain
+            if buy_executed and sell_executed:
+                open_gex = _mt5.positions_get(symbol=win_symbol)
+                if not any(p.magic == GEX_MAGIC_NUMBER for p in (open_gex or [])):
+                    break
+
             tick = _mt5.symbol_info_tick(win_symbol)
             if tick is None:
                 print(f"[GEX Monitor] Could not get tick for {win_symbol}")
@@ -890,21 +902,55 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                   f"{sig} [{strength}/3] | {signal['regime']} | {side_status}")
 
             # --- Execute BUY ---
+            # Fibonacci DCA multipliers — precompute total to size initial volume
+            _fib = [1, 1, 2, 3, 5, 8, 13, 21]
+            _fib_total = 1 + sum(_fib[:GEX_DCA_MAX_ORDERS])  # initial(1×) + all DCA
+
+            # Compute margin budget from live free margin
+            acct = _mt5.account_info()
+            margin_budget = acct.margin_free * GEX_MARGIN_FREE_PCT if acct else 0.0
+
             if (sig == 'BUY' and strength >= GEX_MIN_SIGNAL_STRENGTH
                     and not buy_executed and np.isfinite(win_entry_buy)):
-                print(f"\n[GEX Monitor] *** BUY TRIGGERED @ {tick.ask:.0f} ***")
+                # Compute volume from total margin budget (entry + all DCA)
+                margin_1 = _mt5.order_calc_margin(
+                    _mt5.ORDER_TYPE_BUY, win_symbol, 1.0, tick.ask)
+                if margin_1 is not None and margin_1 > 0 and margin_budget > 0:
+                    vol = int(margin_budget / (margin_1 * _fib_total))
+                    vol = max(vol, int(GEX_ORDER_VOLUME))  # at least min volume
+                    total_margin = margin_1 * vol * _fib_total
+                else:
+                    vol = int(GEX_ORDER_VOLUME)
+                    total_margin = margin_1 if margin_1 else 0.0
+                # Compute SL from risk budget: risk_R$ = margin * SL_RISK_PCT
+                sym_info = _mt5.symbol_info(win_symbol)
+                tick_val = sym_info.trade_tick_value if sym_info else 1.0
+                tick_sz  = sym_info.trade_tick_size if sym_info else 5.0
+                risk_r = margin_budget * GEX_SL_RISK_PCT
+                sl_points = (risk_r / vol) / (tick_val / tick_sz) if vol > 0 and tick_val > 0 else 0.0
+                sl_points = round(sl_points / tick_sz) * tick_sz  # align to tick
+                sl_price = tick.ask - sl_points if sl_points > 0 else 0.0
+                print(f"\n[GEX Monitor] *** BUY TRIGGERED @ {tick.ask:.0f} | {vol} contracts "
+                      f"(budget R${margin_budget:,.2f} [{GEX_MARGIN_FREE_PCT:.1%} free], margin R${total_margin:,.2f}, SL {sl_price:.0f}, risk R${risk_r:,.2f}) ***")
                 result = mt5_conn.place_order(
                     symbol=win_symbol,
                     order_type=_mt5.ORDER_TYPE_BUY,
-                    volume=GEX_ORDER_VOLUME,
+                    volume=float(vol),
                     price=tick.ask,
                     deviation=GEX_ORDER_DEVIATION,
-                    comment=f"GEX BUY PutWall {put_wall:.2f}",
+                    comment=f"GEX BUY {vol}x PutWall {put_wall:.2f}",
                     magic=GEX_MAGIC_NUMBER,
+                    sl=sl_price,
                 )
                 if result is not None and hasattr(result, 'retcode') and result.retcode == _mt5.TRADE_RETCODE_DONE:
                     buy_executed = True
-                    print(f"[GEX Monitor] BUY FILLED — order #{result.order}\n")
+                    trail_buy = {
+                        'entry': tick.ask, 'vol': vol,
+                        'best': tick.ask, 'active': False,
+                        'tick_sz': tick_sz, 'tick_val': tick_val,
+                        'sl_points': sl_points, 'dca_count': 0,
+                    }
+                    print(f"[GEX Monitor] BUY FILLED — {vol} contracts, order #{result.order}\n")
                 else:
                     print(f"[GEX Monitor] BUY order sent (check logs above for status)\n")
                     buy_executed = True  # Avoid repeated attempts on same tick
@@ -912,22 +958,178 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
             # --- Execute SELL ---
             elif (sig == 'SELL' and strength >= GEX_MIN_SIGNAL_STRENGTH
                       and not sell_executed and np.isfinite(win_entry_sell)):
-                print(f"\n[GEX Monitor] *** SELL TRIGGERED @ {tick.bid:.0f} ***")
+                # Compute volume from margin budget
+                margin_1 = _mt5.order_calc_margin(
+                    _mt5.ORDER_TYPE_SELL, win_symbol, 1.0, tick.bid)
+                if margin_1 is not None and margin_1 > 0 and margin_budget > 0:
+                    vol = int(margin_budget / (margin_1 * _fib_total))
+                    vol = max(vol, int(GEX_ORDER_VOLUME))
+                    total_margin = margin_1 * vol * _fib_total
+                else:
+                    vol = int(GEX_ORDER_VOLUME)
+                    total_margin = margin_1 if margin_1 else 0.0
+                # Compute SL from risk budget: risk_R$ = margin * SL_RISK_PCT
+                sym_info = _mt5.symbol_info(win_symbol)
+                tick_val = sym_info.trade_tick_value if sym_info else 1.0
+                tick_sz  = sym_info.trade_tick_size if sym_info else 5.0
+                risk_r = margin_budget * GEX_SL_RISK_PCT
+                sl_points = (risk_r / vol) / (tick_val / tick_sz) if vol > 0 and tick_val > 0 else 0.0
+                sl_points = round(sl_points / tick_sz) * tick_sz  # align to tick
+                sl_price = tick.bid + sl_points if sl_points > 0 else 0.0
+                print(f"\n[GEX Monitor] *** SELL TRIGGERED @ {tick.bid:.0f} | {vol} contracts "
+                      f"(budget R${margin_budget:,.2f} [{GEX_MARGIN_FREE_PCT:.1%} free], margin R${total_margin:,.2f}, SL {sl_price:.0f}, risk R${risk_r:,.2f}) ***")
                 result = mt5_conn.place_order(
                     symbol=win_symbol,
                     order_type=_mt5.ORDER_TYPE_SELL,
-                    volume=GEX_ORDER_VOLUME,
+                    volume=float(vol),
                     price=tick.bid,
                     deviation=GEX_ORDER_DEVIATION,
-                    comment=f"GEX SELL CallWall {call_wall:.2f}",
+                    comment=f"GEX SELL {vol}x CallWall {call_wall:.2f}",
                     magic=GEX_MAGIC_NUMBER,
+                    sl=sl_price,
                 )
                 if result is not None and hasattr(result, 'retcode') and result.retcode == _mt5.TRADE_RETCODE_DONE:
                     sell_executed = True
-                    print(f"[GEX Monitor] SELL FILLED — order #{result.order}\n")
+                    trail_sell = {
+                        'entry': tick.bid, 'vol': vol,
+                        'best': tick.bid, 'active': False,
+                        'tick_sz': tick_sz, 'tick_val': tick_val,
+                        'sl_points': sl_points, 'dca_count': 0,
+                    }
+                    print(f"[GEX Monitor] SELL FILLED — {vol} contracts, order #{result.order}\n")
                 else:
                     print(f"[GEX Monitor] SELL order sent (check logs above for status)\n")
                     sell_executed = True
+
+            # ---- Trailing stop management for open GEX positions ----
+            activation_r = margin_budget * GEX_TRAILING_ACTIVATION_PCT
+
+            positions = _mt5.positions_get(symbol=win_symbol)
+            gex_positions = [p for p in (positions or []) if p.magic == GEX_MAGIC_NUMBER]
+
+            for pos in gex_positions:
+                is_buy = (pos.type == _mt5.POSITION_TYPE_BUY)
+                trail = trail_buy if is_buy else trail_sell
+                if trail is None:
+                    continue
+
+                tk_sz = trail['tick_sz']
+                tk_val = trail['tick_val']
+                pnl_per_pt = pos.volume * (tk_val / tk_sz)  # R$ per price point
+
+                if is_buy:
+                    trail['best'] = max(trail['best'], tick.bid)
+                    profit_pts = trail['best'] - trail['entry']
+                else:
+                    trail['best'] = min(trail['best'], tick.ask)
+                    profit_pts = trail['entry'] - trail['best']
+
+                profit_r = profit_pts * pnl_per_pt
+
+                if not trail['active'] and profit_r >= activation_r:
+                    trail['active'] = True
+                    ts_now = _dt.now().strftime("%H:%M:%S")
+                    print(f"[{ts_now}] [Trailing] {'BUY' if is_buy else 'SELL'} activated — "
+                          f"profit R${profit_r:,.2f} >= R${activation_r:,.2f}")
+
+                if trail['active']:
+                    # Trail SL behind the best price by the original SL distance
+                    if is_buy:
+                        new_sl = trail['best'] - trail['sl_points']
+                        new_sl = round(round(new_sl / tk_sz) * tk_sz, 0)
+                    else:
+                        new_sl = trail['best'] + trail['sl_points']
+                        new_sl = round(round(new_sl / tk_sz) * tk_sz, 0)
+
+                    # Only move SL in the profitable direction
+                    current_sl = pos.sl
+                    should_update = False
+                    if is_buy and (current_sl == 0.0 or new_sl > current_sl):
+                        should_update = True
+                    elif not is_buy and (current_sl == 0.0 or new_sl < current_sl):
+                        should_update = True
+
+                    if should_update:
+                        modify_req = {
+                            "action": _mt5.TRADE_ACTION_SLTP,
+                            "symbol": win_symbol,
+                            "position": pos.ticket,
+                            "sl": new_sl,
+                            "tp": pos.tp,
+                        }
+                        mod_result = _mt5.order_send(modify_req)
+                        ts_now = _dt.now().strftime("%H:%M:%S")
+                        if mod_result and mod_result.retcode == _mt5.TRADE_RETCODE_DONE:
+                            side_label = "BUY" if is_buy else "SELL"
+                            print(f"[{ts_now}] [Trailing] {side_label} SL moved → "
+                                  f"{new_sl:.0f} (best {trail['best']:.0f}, "
+                                  f"profit R${profit_r:,.2f})")
+                        else:
+                            err = mod_result.comment if mod_result else _mt5.last_error()
+                            print(f"[{ts_now}] [Trailing] SL update failed: {err}")
+
+            # ---- DCA: add orders on losing positions at each 10% total margin step ----
+            dca_step_r = margin_budget * GEX_DCA_LOSS_STEP_PCT
+
+            for pos in gex_positions:
+                is_buy = (pos.type == _mt5.POSITION_TYPE_BUY)
+                trail = trail_buy if is_buy else trail_sell
+                if trail is None or trail['active']:
+                    continue  # don't DCA once trailing is active (position winning)
+                if trail['dca_count'] >= GEX_DCA_MAX_ORDERS:
+                    continue  # max DCA reached
+
+                tk_sz = trail['tick_sz']
+                tk_val = trail['tick_val']
+                pnl_per_pt = pos.volume * (tk_val / tk_sz)
+
+                # Current unrealized loss (negative = losing)
+                if is_buy:
+                    loss_pts = trail['entry'] - tick.bid  # positive when losing
+                else:
+                    loss_pts = tick.ask - trail['entry']
+                loss_r = loss_pts * pnl_per_pt
+
+                # How many DCA levels have been crossed?
+                levels_crossed = int(loss_r / dca_step_r) if dca_step_r > 0 else 0
+                needed = levels_crossed - trail['dca_count']
+
+                if needed > 0:
+                    for _ in range(needed):
+                        if trail['dca_count'] >= GEX_DCA_MAX_ORDERS:
+                            break
+                        fib_idx = trail['dca_count'] if trail['dca_count'] < len(_fib) else len(_fib) - 1
+                        dca_vol = trail['vol'] * _fib[fib_idx]
+                        if is_buy:
+                            dca_price = tick.ask
+                            dca_type = _mt5.ORDER_TYPE_BUY
+                        else:
+                            dca_price = tick.bid
+                            dca_type = _mt5.ORDER_TYPE_SELL
+                        dca_n = trail['dca_count'] + 1
+                        ts_now = _dt.now().strftime("%H:%M:%S")
+                        print(f"\n[{ts_now}] [DCA] {'BUY' if is_buy else 'SELL'} #{dca_n}/{GEX_DCA_MAX_ORDERS} "
+                              f"@ {dca_price:.0f} | loss R${loss_r:,.2f} | +{dca_vol} contracts")
+                        dca_result = mt5_conn.place_order(
+                            symbol=win_symbol,
+                            order_type=dca_type,
+                            volume=float(dca_vol),
+                            price=dca_price,
+                            deviation=GEX_ORDER_DEVIATION,
+                            comment=f"GEX DCA#{dca_n} {'BUY' if is_buy else 'SELL'}",
+                            magic=GEX_MAGIC_NUMBER,
+                        )
+                        if dca_result is not None and hasattr(dca_result, 'retcode') and dca_result.retcode == _mt5.TRADE_RETCODE_DONE:
+                            trail['dca_count'] += 1
+                            # Update avg entry for trailing
+                            old_total = trail['entry'] * trail['vol'] * trail['dca_count']
+                            new_total_vol = pos.volume + dca_vol
+                            trail['entry'] = (trail['entry'] * pos.volume + dca_price * dca_vol) / new_total_vol
+                            print(f"[{ts_now}] [DCA] FILLED — avg entry → {trail['entry']:.0f}, "
+                                  f"total {new_total_vol:.0f} contracts")
+                        else:
+                            trail['dca_count'] += 1  # count attempt to avoid rapid retries
+                            print(f"[{ts_now}] [DCA] Order sent (check logs above)")
 
             await asyncio.sleep(GEX_MONITOR_INTERVAL)
 
