@@ -18,6 +18,6 @@ GEX_TRAILING_ACTIVATION_PCT = 0.35 # Trailing stop activates at 35% of margin pr
 GEX_DCA_LOSS_STEP_PCT = 0.10      # Add new order every 10% margin loss (R$50 steps)
 GEX_DCA_MAX_ORDERS = 4            # Max DCA additions per side (total = initial + 4)
 GEX_MIN_SIGNAL_STRENGTH = 2       # Minimum signal strength to place order (0-3)
-GEX_WALL_PROXIMITY_PCT = 0.012    # % distance from wall for entry zone (0.015 = 1.5%)
+GEX_WALL_PROXIMITY_PCT = 0.01    # % distance from wall for entry zone (0.01 = 1%)
 GEX_MONITOR_INTERVAL = 10         # Spot price poll interval in seconds
 GEX_MONITOR_ENABLED = True       # Set to True to start real-time GEX monitor after analysis
