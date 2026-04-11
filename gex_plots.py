@@ -214,7 +214,7 @@ def plot_gex_all_expiry(gex_by_strike, spot, underlying, gamma_flip,
     for text in legend.get_texts():
         text.set_color("#F3F4F6")
 
-    plt.tight_layout(rect=[0, 0.04, 1, 0.95])
+    plt.tight_layout()
 
     if show_plots:
         plt.show()
@@ -408,7 +408,7 @@ def plot_gex_weekly(weekly_results, spot, underlying, show_plots=False,
 
     fig.suptitle(f"{underlying} — Weekly GEX Analysis", fontsize=14,
                  fontweight='bold', color='#F9FAFB', y=0.98)
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.tight_layout()
     if show_plots:
         plt.show()
     plt.close(fig)
