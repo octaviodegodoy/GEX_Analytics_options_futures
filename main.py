@@ -1204,18 +1204,45 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                             break
                         fib_idx = trail['dca_count'] if trail['dca_count'] < len(_fib) else len(_fib) - 1
                         dca_vol = trail['vol'] * _fib[fib_idx]
+
+                        # --- Cap DCA: skip if adding would exceed margin budget ---
+                        margin_1_dca = _mt5.order_calc_margin(
+                            _mt5.ORDER_TYPE_BUY if is_buy else _mt5.ORDER_TYPE_SELL,
+                            win_symbol, float(dca_vol),
+                            tick.ask if is_buy else tick.bid)
+                        current_margin_used = sum(p.volume for p in same_side) * (margin_1_dca / dca_vol if dca_vol > 0 and margin_1_dca else 0)
+                        if margin_1_dca is not None and margin_budget > 0:
+                            if current_margin_used + margin_1_dca > margin_budget:
+                                ts_now = _dt.now().strftime("%H:%M:%S")
+                                print(f"[{ts_now}] [DCA] SKIPPED — margin would exceed budget "
+                                      f"(used R${current_margin_used:,.2f} + R${margin_1_dca:,.2f} > budget R${margin_budget:,.2f})")
+                                break
+
                         if is_buy:
                             dca_price = tick.ask
                             dca_type = _mt5.ORDER_TYPE_BUY
                         else:
                             dca_price = tick.bid
                             dca_type = _mt5.ORDER_TYPE_SELL
+
+                        # --- Recalculate SL to bound aggregate risk within budget ---
+                        new_total_vol_proj = total_vol + dca_vol
+                        new_avg_entry = (trail['entry'] * total_vol + dca_price * dca_vol) / new_total_vol_proj
+                        pnl_per_pt_new = new_total_vol_proj * (tk_val / tk_sz)
+                        risk_r = margin_budget * GEX_SL_RISK_PCT
+                        new_sl_dist = (risk_r / pnl_per_pt_new) if pnl_per_pt_new > 0 else 0.0
+                        new_sl_dist = round(new_sl_dist / tk_sz) * tk_sz
+                        if is_buy:
+                            new_sl = round(round((new_avg_entry - new_sl_dist) / tk_sz) * tk_sz, 0)
+                        else:
+                            new_sl = round(round((new_avg_entry + new_sl_dist) / tk_sz) * tk_sz, 0)
+
                         dca_n = trail['dca_count'] + 1
                         ts_now = _dt.now().strftime("%H:%M:%S")
                         print(f"\n[{ts_now}] [DCA] {'BUY' if is_buy else 'SELL'} #{dca_n}/{GEX_DCA_MAX_ORDERS} "
-                              f"@ {dca_price:.0f} | loss R${loss_r:,.2f} | +{dca_vol} contracts")
+                              f"@ {dca_price:.0f} | loss R${loss_r:,.2f} | +{dca_vol} contracts "
+                              f"| new SL {new_sl:.0f} (risk capped R${risk_r:,.2f})")
                         wall_label = trail.get('wall', 'Wall')
-                        parent_sl = trail.get('sl_price', 0.0)
                         dca_result = mt5_conn.place_order(
                             symbol=win_symbol,
                             order_type=dca_type,
@@ -1224,16 +1251,41 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                             deviation=GEX_ORDER_DEVIATION,
                             comment=f"GEX DCA#{dca_n} {wall_label}",
                             magic=GEX_MAGIC_NUMBER,
-                            sl=parent_sl,
+                            sl=new_sl,
                         )
                         if dca_result is not None and hasattr(dca_result, 'retcode') and dca_result.retcode == _mt5.TRADE_RETCODE_DONE:
                             trail['dca_count'] += 1
-                            # Update avg entry for trailing (across all same-side positions)
+                            # Update avg entry and SL for trailing
                             new_total_vol = total_vol + dca_vol
                             trail['entry'] = (trail['entry'] * total_vol + dca_price * dca_vol) / new_total_vol
-                            total_vol = new_total_vol  # keep running total for subsequent DCA in same tick
+                            trail['sl_points'] = new_sl_dist
+                            trail['sl_price'] = new_sl
+                            total_vol = new_total_vol
                             print(f"[{ts_now}] [DCA] FILLED — avg entry → {trail['entry']:.0f}, "
-                                  f"total {new_total_vol:.0f} contracts")
+                                  f"total {new_total_vol:.0f} contracts, SL → {new_sl:.0f}")
+
+                            # --- Update SL on ALL existing same-side positions ---
+                            for sp in same_side:
+                                current_sp_sl = sp.sl
+                                should_update = False
+                                if is_buy and (current_sp_sl == 0.0 or new_sl != current_sp_sl):
+                                    should_update = True
+                                elif not is_buy and (current_sp_sl == 0.0 or new_sl != current_sp_sl):
+                                    should_update = True
+                                if should_update:
+                                    modify_req = {
+                                        "action": _mt5.TRADE_ACTION_SLTP,
+                                        "symbol": win_symbol,
+                                        "position": sp.ticket,
+                                        "sl": new_sl,
+                                        "tp": sp.tp,
+                                    }
+                                    mod_result = _mt5.order_send(modify_req)
+                                    if mod_result and mod_result.retcode == _mt5.TRADE_RETCODE_DONE:
+                                        print(f"[{ts_now}] [DCA] SL synced #{sp.ticket} → {new_sl:.0f}")
+                                    else:
+                                        err = mod_result.comment if mod_result else _mt5.last_error()
+                                        print(f"[{ts_now}] [DCA] SL sync #{sp.ticket} failed: {err}")
                         else:
                             trail['dca_count'] += 1  # count attempt to avoid rapid retries
                             print(f"[{ts_now}] [DCA] Order sent (check logs above)")

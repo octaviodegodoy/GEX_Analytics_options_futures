@@ -1,0 +1,551 @@
+# -*- coding: utf-8 -*-
+"""
+DCA GEX Strategy — Historical Backtest (Last Week)
+====================================================
+Uses cached B3 COTAHIST options data + MT5 intraday WIN bars
+to replay the strategy with real prices and computed GEX walls.
+
+Flow per trading day:
+  1. Load B3 options chain for that date → compute GEX walls
+  2. Build Kalman mapper for BOVA11↔WIN on that day's bars
+  3. Fetch 5-min WIN bars for intraday replay
+  4. Simulate the DCA GEX monitor logic bar-by-bar
+"""
+import os
+import sys
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+
+# Ensure local imports work
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from constants import (
+    GEX_MARGIN_FREE_PCT, GEX_SL_RISK_PCT, GEX_TRAILING_ACTIVATION_PCT,
+    GEX_DCA_LOSS_STEP_PCT, GEX_DCA_MAX_ORDERS, GEX_ORDER_VOLUME,
+    GEX_WALL_PROXIMITY_PCT, GEX_MIN_SIGNAL_STRENGTH,
+)
+from gex_utils import compute_weekly_walls, find_gamma_flip, generate_gex_trade_signals
+
+# ── WIN contract specs ───────────────────────────────────────────────
+TICK_SIZE  = 5
+PNL_PER_POINT = 0.20  # R$ per point per contract
+
+# ── DCA parameters (must match main.py) ─────────────────────────────
+FIB_SEQ = [1, 1, 2, 3, 5, 8, 13, 21]
+FIB_TOTAL = 1 + sum(FIB_SEQ[:GEX_DCA_MAX_ORDERS])
+
+# ── Simulation assumptions ──────────────────────────────────────────
+FREE_MARGIN = 10_000.0
+MARGIN_PER_LOT = 100.0
+MARGIN_BUDGET = FREE_MARGIN * GEX_MARGIN_FREE_PCT
+
+
+def align_tick(price):
+    return round(round(price / TICK_SIZE) * TICK_SIZE)
+
+
+def _compute_gex_walls_for_day(date_str, spot):
+    """
+    Load B3 options for a specific date, compute GEX columns,
+    then compute weekly walls + combined gamma flip.
+    Returns (call_wall, put_wall, gamma_flip) in BOVA11 terms, or Nones.
+    """
+    from b3_options_loader import load_b3_options_data
+
+    df = load_b3_options_data("BOVA11", spot, date=date_str)
+    if df.empty:
+        return None, None, None
+
+    # Compute customer GEX per row (same formula as main.py)
+    sign = np.where(df['Tipo'].str.upper().str.contains('PUT'), -1.0, 1.0)
+    df['GEX_customer'] = df['Gamma'] * (spot ** 2) * df['Tit.'] * sign
+
+    weekly = compute_weekly_walls(df, spot)
+    if not weekly:
+        return None, None, None
+
+    # Combined walls across weeks (same as main.py)
+    all_gex = pd.concat([w['gex_by_strike'] for w in weekly if not w['gex_by_strike'].empty])
+    if all_gex.empty:
+        return None, None, None
+
+    combined = all_gex.groupby('Strike', as_index=False)['GEX_customer'].sum()
+    above = combined[combined['Strike'] >= spot]
+    below = combined[combined['Strike'] <= spot]
+
+    call_wall = float(above.loc[above['GEX_customer'].idxmax(), 'Strike']) if not above.empty else np.nan
+    put_wall = float(below.loc[below['GEX_customer'].abs().idxmax(), 'Strike']) if not below.empty else np.nan
+
+    gamma_flip = find_gamma_flip(df, spot)
+
+    return call_wall, put_wall, gamma_flip
+
+
+def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
+                 gamma_flip_bova, mapper):
+    """
+    Simulate one trading day of the DCA GEX strategy using intraday bars.
+
+    Parameters
+    ----------
+    day_label    : str   e.g. "2026-04-07"
+    win_bars     : DataFrame with columns: time, open, high, low, close
+    bova_bars    : DataFrame (parallel) — used to derive BOVA spot
+    call_wall_bova, put_wall_bova, gamma_flip_bova : GEX levels in BOVA terms
+    mapper       : KalmanPriceMapper for BOVA↔WIN conversion
+
+    Returns dict with trade results for the day.
+    """
+    vol_initial = max(int(MARGIN_BUDGET / (MARGIN_PER_LOT * FIB_TOTAL)), int(GEX_ORDER_VOLUME))
+    risk_r = MARGIN_BUDGET * GEX_SL_RISK_PCT
+    dca_step_r = MARGIN_BUDGET * GEX_DCA_LOSS_STEP_PCT
+    activation_r = MARGIN_BUDGET * GEX_TRAILING_ACTIVATION_PCT
+
+    # Convert GEX levels to WIN
+    win_call_wall = mapper.bova11_to_ind(call_wall_bova) if np.isfinite(call_wall_bova) else np.nan
+    win_put_wall  = mapper.bova11_to_ind(put_wall_bova) if np.isfinite(put_wall_bova) else np.nan
+
+    entry_buy_bova  = put_wall_bova * (1.0 + GEX_WALL_PROXIMITY_PCT) if np.isfinite(put_wall_bova) else np.nan
+    entry_sell_bova = call_wall_bova * (1.0 - GEX_WALL_PROXIMITY_PCT) if np.isfinite(call_wall_bova) else np.nan
+
+    trades = []  # list of completed trade dicts
+
+    # Per-side state
+    for side_label, is_buy, entry_bova in [
+        ('BUY', True, entry_buy_bova),
+        ('SELL', False, entry_sell_bova)
+    ]:
+        if not np.isfinite(entry_bova):
+            continue
+
+        executed = False
+        trail = None
+
+        for i, bar in win_bars.iterrows():
+            win_mid = (bar['high'] + bar['low']) / 2.0
+            bova_spot = mapper.ind_to_bova11(win_mid)
+
+            signal = generate_gex_trade_signals(
+                bova_spot, gamma_flip_bova, call_wall_bova, put_wall_bova)
+            sig = signal['signal']
+            strength = signal['strength']
+
+            # ── Check entry ──────────────────────────────────
+            if not executed:
+                trigger = False
+                if is_buy and sig == 'BUY' and strength >= GEX_MIN_SIGNAL_STRENGTH:
+                    trigger = True
+                    entry_price = align_tick(bar['high'])  # conservative: buy at high
+                elif not is_buy and sig == 'SELL' and strength >= GEX_MIN_SIGNAL_STRENGTH:
+                    trigger = True
+                    entry_price = align_tick(bar['low'])  # conservative: sell at low
+
+                if trigger:
+                    vol = vol_initial
+                    sl_dist = (risk_r / vol) / PNL_PER_POINT if vol > 0 else 0
+                    sl_dist = round(sl_dist / TICK_SIZE) * TICK_SIZE
+                    if is_buy:
+                        sl_price = align_tick(entry_price - sl_dist)
+                    else:
+                        sl_price = align_tick(entry_price + sl_dist)
+
+                    trail = {
+                        'entry': entry_price, 'avg_entry': entry_price,
+                        'vol': vol, 'total_vol': vol,
+                        'best': entry_price, 'active': False,
+                        'sl_dist': sl_dist, 'sl_price': sl_price,
+                        'dca_count': 0, 'entry_time': bar['time'],
+                        'positions': [{'entry': entry_price, 'vol': vol, 'label': 'Initial'}],
+                    }
+                    executed = True
+                continue
+
+            # ── Position active: check SL, DCA, trailing ─────
+            if is_buy:
+                check_price = bar['low']  # worst for long
+                best_price = bar['high']  # best for long
+            else:
+                check_price = bar['high']  # worst for short
+                best_price = bar['low']   # best for short
+
+            avg = trail['avg_entry']
+            tvol = trail['total_vol']
+            pnl_per_pt = tvol * PNL_PER_POINT
+
+            # Update best
+            if is_buy:
+                trail['best'] = max(trail['best'], best_price)
+            else:
+                trail['best'] = min(trail['best'], best_price)
+
+            # ── SL check ─────────────────────────────────────
+            stopped = False
+            if is_buy and check_price <= trail['sl_price']:
+                stopped = True
+                exit_price = trail['sl_price']
+            elif not is_buy and check_price >= trail['sl_price']:
+                stopped = True
+                exit_price = trail['sl_price']
+
+            if stopped:
+                if is_buy:
+                    pnl_pts = exit_price - avg
+                else:
+                    pnl_pts = avg - exit_price
+                pnl_r = pnl_pts * tvol * PNL_PER_POINT
+
+                trades.append({
+                    'day': day_label, 'side': side_label,
+                    'entry': trail['entry'], 'avg_entry': avg,
+                    'exit': exit_price, 'exit_time': bar['time'],
+                    'entry_time': trail['entry_time'],
+                    'vol': tvol, 'dca': trail['dca_count'],
+                    'pnl_pts': pnl_pts, 'pnl_r': pnl_r,
+                    'exit_type': 'STOP',
+                    'trailing': trail['active'],
+                    'call_wall': call_wall_bova, 'put_wall': put_wall_bova,
+                    'gamma_flip': gamma_flip_bova,
+                })
+                break
+
+            # ── DCA (before trailing activates) ──────────────
+            if not trail['active'] and trail['dca_count'] < GEX_DCA_MAX_ORDERS:
+                if is_buy:
+                    loss_pts = avg - check_price
+                else:
+                    loss_pts = check_price - avg
+                loss_r = loss_pts * tvol * PNL_PER_POINT
+
+                if loss_r > 0:
+                    levels_crossed = int(loss_r / dca_step_r) if dca_step_r > 0 else 0
+                    needed = levels_crossed - trail['dca_count']
+                    for _ in range(needed):
+                        if trail['dca_count'] >= GEX_DCA_MAX_ORDERS:
+                            break
+                        fib_idx = min(trail['dca_count'], len(FIB_SEQ) - 1)
+                        dca_vol = trail['vol'] * FIB_SEQ[fib_idx]
+
+                        # Margin cap check
+                        margin_used = tvol * MARGIN_PER_LOT
+                        margin_needed = dca_vol * MARGIN_PER_LOT
+                        if margin_used + margin_needed > MARGIN_BUDGET:
+                            break
+
+                        dca_price = align_tick(check_price)
+                        new_total = tvol + dca_vol
+                        new_avg = (avg * tvol + dca_price * dca_vol) / new_total
+
+                        # Recalculate SL to bound aggregate risk
+                        pnl_per_pt_new = new_total * PNL_PER_POINT
+                        new_sl_dist = (risk_r / pnl_per_pt_new) if pnl_per_pt_new > 0 else 0
+                        new_sl_dist = round(new_sl_dist / TICK_SIZE) * TICK_SIZE
+                        if is_buy:
+                            new_sl = align_tick(new_avg - new_sl_dist)
+                        else:
+                            new_sl = align_tick(new_avg + new_sl_dist)
+
+                        trail['avg_entry'] = new_avg
+                        trail['total_vol'] = new_total
+                        trail['sl_dist'] = new_sl_dist
+                        trail['sl_price'] = new_sl
+                        trail['dca_count'] += 1
+                        trail['positions'].append({
+                            'entry': dca_price, 'vol': dca_vol,
+                            'label': f"DCA#{trail['dca_count']}"
+                        })
+                        avg = new_avg
+                        tvol = new_total
+
+            # ── Trailing activation ──────────────────────────
+            if is_buy:
+                profit_pts = trail['best'] - avg
+            else:
+                profit_pts = avg - trail['best']
+            profit_r = profit_pts * tvol * PNL_PER_POINT
+
+            if not trail['active'] and profit_r >= activation_r:
+                trail['active'] = True
+
+            if trail['active']:
+                if is_buy:
+                    new_sl = align_tick(trail['best'] - trail['sl_dist'])
+                    if new_sl > trail['sl_price']:
+                        trail['sl_price'] = new_sl
+                else:
+                    new_sl = align_tick(trail['best'] + trail['sl_dist'])
+                    if new_sl < trail['sl_price']:
+                        trail['sl_price'] = new_sl
+
+        else:
+            # Day ended without stop — mark to market at close
+            if executed and trail is not None:
+                close_price = align_tick(win_bars.iloc[-1]['close'])
+                if is_buy:
+                    pnl_pts = close_price - trail['avg_entry']
+                else:
+                    pnl_pts = trail['avg_entry'] - close_price
+                pnl_r = pnl_pts * trail['total_vol'] * PNL_PER_POINT
+
+                trades.append({
+                    'day': day_label, 'side': side_label,
+                    'entry': trail['entry'], 'avg_entry': trail['avg_entry'],
+                    'exit': close_price, 'exit_time': win_bars.iloc[-1]['time'],
+                    'entry_time': trail['entry_time'],
+                    'vol': trail['total_vol'], 'dca': trail['dca_count'],
+                    'pnl_pts': pnl_pts, 'pnl_r': pnl_r,
+                    'exit_type': 'EOD',
+                    'trailing': trail['active'],
+                    'call_wall': call_wall_bova, 'put_wall': put_wall_bova,
+                    'gamma_flip': gamma_flip_bova,
+                })
+
+    return trades
+
+
+def main():
+    import MetaTrader5 as mt5
+    from mt5_connector import MT5Connector
+    from di1_rate_curve import build_di1_curve
+    from kalman_price_mapper import build_ind_bova11_mapper_intraday
+
+    mt5_conn = MT5Connector()
+    build_di1_curve(mt5_conn)
+
+    # Resolve current WIN symbol
+    try:
+        _, win_symbol = mt5_conn.get_symbol_futures("*WIN*")
+        print(f"[i] WIN contract: {win_symbol}")
+    except Exception as e:
+        win_symbol = "WIN$N"
+        print(f"[i] Falling back to {win_symbol}: {e}")
+
+    # Build Kalman mapper on 15-min intraday data (more bars = reliable fit)
+    mapper = None
+    for ind_sym in ["WIN$N", win_symbol]:
+        try:
+            mapper = build_ind_bova11_mapper_intraday(
+                mt5_conn, ind_symbol=ind_sym, bova11_symbol="BOVA11", max_days=10)
+            print(f"[i] Kalman mapper built (intraday 15m) using {ind_sym}")
+            break
+        except Exception as e:
+            print(f"[!] Mapper with {ind_sym} failed: {e}")
+    if mapper is None:
+        print("[!] Could not build Kalman mapper — aborting")
+        return
+
+    # ── Determine backtest dates: last week (trading days with cached data) ──
+    # Cached files in .b3_cache: COTAHIST_D{DDMMYYYY}.ZIP
+    cache_dir = os.path.join(SCRIPT_DIR, ".b3_cache")
+    cached_dates = []
+    for f in sorted(os.listdir(cache_dir)):
+        if f.startswith("COTAHIST_D") and f.endswith(".ZIP"):
+            try:
+                ds = f.replace("COTAHIST_D", "").replace(".ZIP", "")
+                d = datetime.strptime(ds, "%d%m%Y")
+                cached_dates.append(d)
+            except ValueError:
+                continue
+
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    # Last 5 business days (Mon-Fri) before today that have cached data
+    last_week = [d for d in cached_dates
+                 if d < today and d.weekday() < 5]
+    last_week = sorted(last_week)[-5:]  # last 5 trading days
+
+    if not last_week:
+        print("[!] No cached B3 data for last week. Run main.py first to cache data.")
+        return
+
+    print(f"\n{'='*80}")
+    print(f"  DCA GEX STRATEGY — HISTORICAL BACKTEST")
+    print(f"  Dates: {last_week[0].strftime('%Y-%m-%d')} to {last_week[-1].strftime('%Y-%m-%d')}")
+    print(f"  WIN Symbol: {win_symbol}")
+    print(f"{'='*80}")
+    print(f"  Parameters:")
+    print(f"    Margin Budget     = R$ {MARGIN_BUDGET:,.2f} ({GEX_MARGIN_FREE_PCT:.0%} of R${FREE_MARGIN:,.0f})")
+    print(f"    SL Risk           = R$ {MARGIN_BUDGET * GEX_SL_RISK_PCT:,.2f} ({GEX_SL_RISK_PCT:.0%})")
+    print(f"    DCA Step          = R$ {MARGIN_BUDGET * GEX_DCA_LOSS_STEP_PCT:,.2f} ({GEX_DCA_LOSS_STEP_PCT:.0%})")
+    print(f"    Trailing Activate = R$ {MARGIN_BUDGET * GEX_TRAILING_ACTIVATION_PCT:,.2f} ({GEX_TRAILING_ACTIVATION_PCT:.0%})")
+    print(f"    DCA Max Orders    = {GEX_DCA_MAX_ORDERS}")
+    print(f"    Fib Sequence      = {FIB_SEQ[:GEX_DCA_MAX_ORDERS]}")
+    print(f"    Wall Proximity    = {GEX_WALL_PROXIMITY_PCT:.1%}")
+    print(f"{'='*80}\n")
+
+    all_trades = []
+
+    for day_dt in last_week:
+        day_str = day_dt.strftime("%Y-%m-%d")
+        b3_date = day_dt.strftime("%Y-%m-%d")
+        print(f"\n{'─'*80}")
+        print(f"  DAY: {day_str} ({day_dt.strftime('%A')})")
+        print(f"{'─'*80}")
+
+        # Fetch BOVA11 spot for this day (daily bar)
+        # Get daily bars up to this day
+        bova_daily = mt5_conn.get_data("BOVA11", mt5.TIMEFRAME_D1, 10, 0)
+        if bova_daily is None or bova_daily.empty:
+            print(f"  [!] No BOVA11 daily data — skipping")
+            continue
+
+        # Find the bar matching this day (or nearest prior)
+        bova_daily['date'] = bova_daily['time'].dt.date
+        day_bar = bova_daily[bova_daily['date'] <= day_dt.date()]
+        if day_bar.empty:
+            print(f"  [!] No BOVA11 bar for {day_str} — skipping")
+            continue
+        day_open_bova = float(day_bar.iloc[-1]['open'])
+        day_close_bova = float(day_bar.iloc[-1]['close'])
+        spot_bova = day_open_bova  # Use open for GEX calc (pre-market)
+
+        print(f"  BOVA11: open={spot_bova:.2f}, close={day_close_bova:.2f}")
+
+        # ── Compute GEX walls from cached B3 data ────────────
+        call_wall, put_wall, gamma_flip = _compute_gex_walls_for_day(b3_date, spot_bova)
+        if call_wall is None or not np.isfinite(call_wall):
+            print(f"  [!] Could not compute GEX walls — skipping")
+            continue
+
+        win_cw = mapper.bova11_to_ind(call_wall) if np.isfinite(call_wall) else np.nan
+        win_pw = mapper.bova11_to_ind(put_wall) if np.isfinite(put_wall) else np.nan
+        win_gf = mapper.bova11_to_ind(gamma_flip) if np.isfinite(gamma_flip) else np.nan
+
+        print(f"  GEX Walls (BOVA): CW={call_wall:.2f}  PW={put_wall:.2f}  Flip={gamma_flip:.2f}")
+        print(f"  GEX Walls (WIN) : CW={win_cw:.0f}  PW={win_pw:.0f}  Flip={win_gf:.0f}")
+
+        # ── Fetch intraday 5-min WIN bars for this day ───────
+        # We fetch enough bars to cover last week then filter to the target day
+        bars_per_day = 90  # ~7.5 hours × 12 bars/hour at 5-min
+        total_bars = bars_per_day * 10  # extra buffer
+        win_intra = mt5_conn.get_data(win_symbol, mt5.TIMEFRAME_M5, total_bars, 0)
+        if win_intra is None or win_intra.empty:
+            # Try continuous contract
+            win_intra = mt5_conn.get_data("WIN$N", mt5.TIMEFRAME_M5, total_bars, 0)
+
+        if win_intra is None or win_intra.empty:
+            print(f"  [!] No intraday WIN data — skipping")
+            continue
+
+        win_intra['date'] = win_intra['time'].dt.date
+        day_bars = win_intra[win_intra['date'] == day_dt.date()].copy()
+
+        if day_bars.empty:
+            print(f"  [!] No 5-min bars for {day_str} — skipping")
+            continue
+
+        # Also fetch BOVA11 intraday for mapper validation
+        bova_intra = mt5_conn.get_data("BOVA11", mt5.TIMEFRAME_M5, total_bars, 0)
+        if bova_intra is not None and not bova_intra.empty:
+            bova_intra['date'] = bova_intra['time'].dt.date
+            bova_day = bova_intra[bova_intra['date'] == day_dt.date()].copy()
+        else:
+            bova_day = pd.DataFrame()
+
+        print(f"  WIN bars: {len(day_bars)} (5-min) | "
+              f"Range: {day_bars.iloc[0]['time'].strftime('%H:%M')}-{day_bars.iloc[-1]['time'].strftime('%H:%M')}")
+        print(f"  WIN range: {day_bars['low'].min():.0f} - {day_bars['high'].max():.0f}")
+
+        # ── Run simulation ────────────────────────────────────
+        day_trades = simulate_day(
+            day_label=day_str,
+            win_bars=day_bars.reset_index(drop=True),
+            bova_bars=bova_day,
+            call_wall_bova=call_wall,
+            put_wall_bova=put_wall,
+            gamma_flip_bova=gamma_flip,
+            mapper=mapper,
+        )
+
+        if not day_trades:
+            print(f"  → No signals triggered (no trades)")
+        for t in day_trades:
+            pnl_sign = '+' if t['pnl_r'] >= 0 else ''
+            print(f"  → {t['side']:4s} @ {t['entry']:>8,.0f} → {t['exit']:>8,.0f} "
+                  f"({t['exit_type']:4s}) | vol={t['vol']} dca={t['dca']} | "
+                  f"P&L: {pnl_sign}R$ {t['pnl_r']:>8,.2f} "
+                  f"({t['pnl_pts']:>+,.0f} pts) "
+                  f"| trail={'Y' if t['trailing'] else 'N'}")
+            all_trades.append(t)
+
+    # ══════════════════════════════════════════════════════════════════
+    # SUMMARY REPORT
+    # ══════════════════════════════════════════════════════════════════
+    print(f"\n\n{'='*100}")
+    print(f"  BACKTEST SUMMARY — {last_week[0].strftime('%Y-%m-%d')} to {last_week[-1].strftime('%Y-%m-%d')}")
+    print(f"{'='*100}")
+
+    if not all_trades:
+        print("  No trades executed during the period.")
+        return
+
+    df_trades = pd.DataFrame(all_trades)
+
+    total_pnl = df_trades['pnl_r'].sum()
+    n_trades = len(df_trades)
+    n_wins = (df_trades['pnl_r'] > 0).sum()
+    n_losses = (df_trades['pnl_r'] < 0).sum()
+    n_be = (df_trades['pnl_r'] == 0).sum()
+    win_rate = n_wins / n_trades * 100 if n_trades > 0 else 0
+    avg_win = df_trades[df_trades['pnl_r'] > 0]['pnl_r'].mean() if n_wins > 0 else 0
+    avg_loss = df_trades[df_trades['pnl_r'] < 0]['pnl_r'].mean() if n_losses > 0 else 0
+    max_win = df_trades['pnl_r'].max()
+    max_loss = df_trades['pnl_r'].min()
+    profit_factor = abs(avg_win * n_wins / (avg_loss * n_losses)) if n_losses > 0 and avg_loss != 0 else float('inf')
+
+    # Per-side breakdown
+    buys = df_trades[df_trades['side'] == 'BUY']
+    sells = df_trades[df_trades['side'] == 'SELL']
+
+    print(f"\n  {'TRADE LOG':^96}")
+    print(f"  {'─'*96}")
+    print(f"  {'Day':<12} {'Side':<5} {'Entry':>8} {'Avg':>8} {'Exit':>8} {'Type':>4} {'Vol':>4} "
+          f"{'DCA':>3} {'Trail':>5} {'P&L R$':>12} {'P&L pts':>10}")
+    print(f"  {'─'*96}")
+    for _, t in df_trades.iterrows():
+        p = '+' if t['pnl_r'] >= 0 else ''
+        print(f"  {t['day']:<12} {t['side']:<5} {t['entry']:>8,.0f} {t['avg_entry']:>8,.0f} "
+              f"{t['exit']:>8,.0f} {t['exit_type']:>4} {t['vol']:>4} {t['dca']:>3} "
+              f"{'Y' if t['trailing'] else 'N':>5} "
+              f"{p}R$ {t['pnl_r']:>9,.2f} {t['pnl_pts']:>+10,.0f}")
+    print(f"  {'─'*96}")
+    print(f"  {'TOTAL':<60} {'' :>18} R$ {total_pnl:>+10,.2f}")
+
+    print(f"\n  {'STATISTICS':^70}")
+    print(f"  {'─'*70}")
+    print(f"    Total Trades       : {n_trades}")
+    print(f"    Wins / Losses / BE : {n_wins} / {n_losses} / {n_be}")
+    print(f"    Win Rate           : {win_rate:.1f}%")
+    print(f"    Total P&L          : R$ {total_pnl:+,.2f}")
+    print(f"    Avg Win            : R$ {avg_win:+,.2f}")
+    print(f"    Avg Loss           : R$ {avg_loss:+,.2f}")
+    print(f"    Max Win            : R$ {max_win:+,.2f}")
+    print(f"    Max Loss           : R$ {max_loss:+,.2f}")
+    print(f"    Profit Factor      : {profit_factor:.2f}")
+    print(f"    ROI on Budget      : {total_pnl / MARGIN_BUDGET * 100:+.1f}%")
+
+    if not buys.empty:
+        print(f"\n    BUY side  : {len(buys)} trades, P&L R$ {buys['pnl_r'].sum():+,.2f}, "
+              f"win rate {(buys['pnl_r'] > 0).mean()*100:.0f}%")
+    if not sells.empty:
+        print(f"    SELL side : {len(sells)} trades, P&L R$ {sells['pnl_r'].sum():+,.2f}, "
+              f"win rate {(sells['pnl_r'] > 0).mean()*100:.0f}%")
+
+    # Per-day P&L
+    print(f"\n  {'DAILY P&L':^70}")
+    print(f"  {'─'*70}")
+    daily = df_trades.groupby('day')['pnl_r'].sum()
+    cum = 0
+    for day, pnl in daily.items():
+        cum += pnl
+        bar = '█' * max(1, int(abs(pnl) / 20))
+        color = '+' if pnl >= 0 else '-'
+        print(f"    {day}  R$ {pnl:>+9,.2f}  cum: R$ {cum:>+9,.2f}  {color}{bar}")
+    print(f"  {'─'*70}")
+    print(f"    CUMULATIVE: R$ {cum:>+9,.2f}  ({cum / MARGIN_BUDGET * 100:+.1f}% ROI)")
+    print()
+
+
+if __name__ == "__main__":
+    main()

@@ -256,14 +256,14 @@ def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
 
     # --- Regime ---
     flip_dist_pct = (spot - gamma_flip) / gamma_flip
-    if flip_dist_pct > 0.005:
+    if flip_dist_pct > 0.0025:
         result['regime'] = 'POSITIVE_GAMMA'
-    elif flip_dist_pct < -0.005:
+    elif flip_dist_pct < -0.0025:
         result['regime'] = 'NEGATIVE_GAMMA'
     else:
         result['regime'] = 'TRANSITION'
         result['reason'] = (
-            f'Spot ({spot:.2f}) within 0.5% of gamma flip ({gamma_flip:.2f}). '
+            f'Spot ({spot:.2f}) within 0.25% of gamma flip ({gamma_flip:.2f}). '
             'Unstable zone — reduce size, wait for confirmation.'
         )
         result['strength'] = 0
