@@ -118,10 +118,13 @@ def load_b3_options_data(underlying, spot, date=None):
 
     # ---- Merge real OI data if available ----
     oi_source = 'daily_volume'
+    option_tickers = list(options['ticker'].values)
     try:
         oi_data = fetch_open_interest(
             underlying=underlying,
             multiday_days=5,
+            spot=spot,
+            tickers=option_tickers,
         )
         if not oi_data.empty and 'ticker' in oi_data.columns and 'oi' in oi_data.columns:
             oi_map = oi_data.set_index('ticker')['oi'].to_dict()

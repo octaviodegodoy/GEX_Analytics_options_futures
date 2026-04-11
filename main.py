@@ -48,6 +48,7 @@ from constants import GEX_SEND_ORDERS, GEX_ORDER_VOLUME, GEX_ORDER_DEVIATION, GE
 from constants import GEX_MONITOR_INTERVAL, GEX_MONITOR_ENABLED, GEX_MAGIC_NUMBER, GEX_WALL_PROXIMITY_PCT
 from constants import GEX_MARGIN_FREE_PCT, GEX_SL_RISK_PCT, GEX_TRAILING_ACTIVATION_PCT
 from constants import GEX_DCA_LOSS_STEP_PCT, GEX_DCA_MAX_ORDERS
+from constants import GEX_RTD_REFRESH_INTERVAL
 from gex_utils import find_gamma_flip, compute_weekly_walls, generate_gex_trade_signals
 from gex_plots import plot_notional_by_strike, plot_gex_all_expiry, plot_gex_weekly
 from b3_options_loader import load_b3_options_data
@@ -838,10 +839,15 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
     the trade signal with the current spot, and sends a market order when
     a wall entry is triggered with sufficient signal strength.
 
+    When RTD OI file is updated (Profit Pro export), GEX levels are
+    recalculated automatically (controlled by GEX_RTD_REFRESH_INTERVAL).
+
     Stops when both BUY and SELL sides have been executed, or on KeyboardInterrupt.
     """
     import MetaTrader5 as _mt5
     from datetime import datetime as _dt
+    from rtd_oi_reader import rtd_data_changed, rtd_shutdown
+    import time as _time
 
     proximity_pct = GEX_WALL_PROXIMITY_PCT
     entry_buy_bova  = put_wall * (1.0 + proximity_pct) if np.isfinite(put_wall) and put_wall > 0 else np.nan
@@ -879,12 +885,56 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
     print(f"  Volume     : {GEX_ORDER_VOLUME}")
     print(f"  Interval   : {GEX_MONITOR_INTERVAL}s")
     print(f"  Min Strength: {GEX_MIN_SIGNAL_STRENGTH}/3")
+    print(f"  RTD Refresh : {'every ' + str(GEX_RTD_REFRESH_INTERVAL) + 's' if GEX_RTD_REFRESH_INTERVAL > 0 else 'disabled'}")
     print(f"{'='*75}")
     print(f"  Press Ctrl+C to stop monitoring.\n")
+
+    # RTD OI refresh state
+    _rtd_last_check = _time.monotonic()
 
     tick_count = 0
     try:
         while True:
+            # --- RTD OI refresh: recalculate GEX when Profit Pro updates the file ---
+            if GEX_RTD_REFRESH_INTERVAL > 0:
+                now_mono = _time.monotonic()
+                if now_mono - _rtd_last_check >= GEX_RTD_REFRESH_INTERVAL:
+                    _rtd_last_check = now_mono
+                    if rtd_data_changed():
+                        ts_now = _dt.now().strftime("%H:%M:%S")
+                        print(f"\n[{ts_now}] [RTD] OI file updated — recalculating GEX levels...")
+                        try:
+                            sym_info = _mt5.symbol_info("BOVA11")
+                            rtd_spot = (sym_info.bid + sym_info.ask) / 2.0 if sym_info else 0.0
+                            if rtd_spot > 0:
+                                rtd_result = await analyze_options(
+                                    rtd_spot, "BOVA11",
+                                    win_mapper=win_mapper,
+                                    win_symbol=win_symbol,
+                                    mt5_conn=mt5_conn,
+                                )
+                                if rtd_result is not None:
+                                    old_cw, old_pw, old_gf = call_wall, put_wall, gamma_flip
+                                    call_wall = rtd_result['call_wall']
+                                    put_wall = rtd_result['put_wall']
+                                    gamma_flip = rtd_result['gamma_flip']
+
+                                    # Recompute entry levels
+                                    entry_buy_bova = put_wall * (1.0 + proximity_pct) if np.isfinite(put_wall) and put_wall > 0 else np.nan
+                                    entry_sell_bova = call_wall * (1.0 - proximity_pct) if np.isfinite(call_wall) and call_wall > 0 else np.nan
+                                    win_entry_buy = win_mapper.bova11_to_ind(entry_buy_bova) if np.isfinite(entry_buy_bova) else np.nan
+                                    win_entry_sell = win_mapper.bova11_to_ind(entry_sell_bova) if np.isfinite(entry_sell_bova) else np.nan
+
+                                    print(f"[{ts_now}] [RTD] GEX REFRESHED")
+                                    print(f"  Call Wall : {old_cw:.2f} → {call_wall:.2f}" if np.isfinite(call_wall) else f"  Call Wall : N/A")
+                                    print(f"  Put Wall  : {old_pw:.2f} → {put_wall:.2f}" if np.isfinite(put_wall) else f"  Put Wall  : N/A")
+                                    print(f"  Gamma Flip: {old_gf:.2f} → {gamma_flip:.2f}" if np.isfinite(gamma_flip) else f"  Gamma Flip: N/A")
+                                else:
+                                    print(f"[{ts_now}] [RTD] Reanalysis returned nothing — keeping old levels")
+                        except Exception as e:
+                            ts_now = _dt.now().strftime("%H:%M:%S")
+                            print(f"[{ts_now}] [RTD] Refresh failed: {e} — keeping old levels")
+
             # Stop when both sides executed and no open GEX positions remain
             if buy_executed and sell_executed:
                 open_gex = _mt5.positions_get(symbol=win_symbol)
