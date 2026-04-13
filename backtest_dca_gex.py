@@ -28,6 +28,7 @@ from constants import (
     GEX_WALL_PROXIMITY_PCT, GEX_MIN_SIGNAL_STRENGTH,
 )
 from gex_utils import compute_weekly_walls, find_gamma_flip, generate_gex_trade_signals
+from main import _select_significant_zones
 
 # ── WIN contract specs ───────────────────────────────────────────────
 TICK_SIZE  = 5
@@ -51,13 +52,13 @@ def _compute_gex_walls_for_day(date_str, spot):
     """
     Load B3 options for a specific date, compute GEX columns,
     then compute weekly walls + combined gamma flip.
-    Returns (call_wall, put_wall, gamma_flip) in BOVA11 terms, or Nones.
+    Returns (call_wall, put_wall, gamma_flip, support_zones, resist_zones) in BOVA11 terms, or Nones.
     """
     from b3_options_loader import load_b3_options_data
 
     df = load_b3_options_data("BOVA11", spot, date=date_str)
     if df.empty:
-        return None, None, None
+        return None, None, None, pd.DataFrame(), pd.DataFrame()
 
     # Compute customer GEX per row (same formula as main.py)
     sign = np.where(df['Tipo'].str.upper().str.contains('PUT'), -1.0, 1.0)
@@ -65,12 +66,12 @@ def _compute_gex_walls_for_day(date_str, spot):
 
     weekly = compute_weekly_walls(df, spot)
     if not weekly:
-        return None, None, None
+        return None, None, None, pd.DataFrame(), pd.DataFrame()
 
     # Combined walls across weeks (same as main.py)
     all_gex = pd.concat([w['gex_by_strike'] for w in weekly if not w['gex_by_strike'].empty])
     if all_gex.empty:
-        return None, None, None
+        return None, None, None, pd.DataFrame(), pd.DataFrame()
 
     combined = all_gex.groupby('Strike', as_index=False)['GEX_customer'].sum()
     above = combined[combined['Strike'] >= spot]
@@ -81,11 +82,14 @@ def _compute_gex_walls_for_day(date_str, spot):
 
     gamma_flip = find_gamma_flip(df, spot)
 
-    return call_wall, put_wall, gamma_flip
+    # Compute support / resistance zones for entry levels
+    resist_zones, support_zones = _select_significant_zones(combined, spot, top_n=3, zone_pct=0.04)
+
+    return call_wall, put_wall, gamma_flip, support_zones, resist_zones
 
 
 def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
-                 gamma_flip_bova, mapper):
+                 gamma_flip_bova, mapper, support_zones=None, resist_zones=None):
     """
     Simulate one trading day of the DCA GEX strategy using intraday bars.
 
@@ -108,8 +112,17 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
     win_call_wall = mapper.bova11_to_ind(call_wall_bova) if np.isfinite(call_wall_bova) else np.nan
     win_put_wall  = mapper.bova11_to_ind(put_wall_bova) if np.isfinite(put_wall_bova) else np.nan
 
-    entry_buy_bova  = put_wall_bova * (1.0 + GEX_WALL_PROXIMITY_PCT) if np.isfinite(put_wall_bova) else np.nan
-    entry_sell_bova = call_wall_bova * (1.0 - GEX_WALL_PROXIMITY_PCT) if np.isfinite(call_wall_bova) else np.nan
+    # Entry levels from nearest support / resistance zones
+    if support_zones is not None and not support_zones.empty:
+        below = support_zones[support_zones['Strike'] <= mapper.ind_to_bova11((win_bars['high'].iloc[0] + win_bars['low'].iloc[0]) / 2.0)]
+        entry_buy_bova = float(below['Strike'].max()) if not below.empty else np.nan
+    else:
+        entry_buy_bova = put_wall_bova * (1.0 + GEX_WALL_PROXIMITY_PCT) if np.isfinite(put_wall_bova) else np.nan
+    if resist_zones is not None and not resist_zones.empty:
+        above = resist_zones[resist_zones['Strike'] >= mapper.ind_to_bova11((win_bars['high'].iloc[0] + win_bars['low'].iloc[0]) / 2.0)]
+        entry_sell_bova = float(above['Strike'].min()) if not above.empty else np.nan
+    else:
+        entry_sell_bova = call_wall_bova * (1.0 - GEX_WALL_PROXIMITY_PCT) if np.isfinite(call_wall_bova) else np.nan
 
     trades = []  # list of completed trade dicts
 
@@ -129,7 +142,8 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
             bova_spot = mapper.ind_to_bova11(win_mid)
 
             signal = generate_gex_trade_signals(
-                bova_spot, gamma_flip_bova, call_wall_bova, put_wall_bova)
+                bova_spot, gamma_flip_bova, call_wall_bova, put_wall_bova,
+                support_zones=support_zones, resist_zones=resist_zones)
             sig = signal['signal']
             strength = signal['strength']
 
@@ -403,7 +417,7 @@ def main():
         print(f"  BOVA11: open={spot_bova:.2f}, close={day_close_bova:.2f}")
 
         # ── Compute GEX walls from cached B3 data ────────────
-        call_wall, put_wall, gamma_flip = _compute_gex_walls_for_day(b3_date, spot_bova)
+        call_wall, put_wall, gamma_flip, sup_zones, res_zones = _compute_gex_walls_for_day(b3_date, spot_bova)
         if call_wall is None or not np.isfinite(call_wall):
             print(f"  [!] Could not compute GEX walls — skipping")
             continue
@@ -456,6 +470,8 @@ def main():
             put_wall_bova=put_wall,
             gamma_flip_bova=gamma_flip,
             mapper=mapper,
+            support_zones=sup_zones,
+            resist_zones=res_zones,
         )
 
         if not day_trades:

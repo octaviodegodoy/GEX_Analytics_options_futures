@@ -19,7 +19,7 @@ input bool   InpShowComment  = true;       // Show dashboard comment
 //--- Level storage
 double g_spot, g_call_wall, g_put_wall, g_gamma_flip, g_regime;
 
-// Entry lines (1.5% proximity from walls)
+// Entry lines (nearest support / resistance zone)
 double g_entry_buy, g_entry_sell;
 double g_win_entry_buy, g_win_entry_sell;
 
@@ -356,12 +356,12 @@ void DrawLevels()
    MakeHLine("GammaFlip", Pick(g_gamma_flip, g_win_gamma_flip), clrGold, 2, STYLE_DASH,
              "Gamma Flip: " + WinLabel(g_gamma_flip, g_win_gamma_flip));
 
-   // --- Entry lines (1.5% proximity zone from walls) ---
+   // --- Entry lines (nearest S/R zone to spot) ---
    MakeHLine("EntryBuy", Pick(g_entry_buy, g_win_entry_buy), clrLime, 2, STYLE_DASHDOTDOT,
-             "ENTRY BUY: " + WinLabel(g_entry_buy, g_win_entry_buy));
+             "ENTRY BUY (S/R): " + WinLabel(g_entry_buy, g_win_entry_buy));
 
    MakeHLine("EntrySell", Pick(g_entry_sell, g_win_entry_sell), clrRed, 2, STYLE_DASHDOTDOT,
-             "ENTRY SELL: " + WinLabel(g_entry_sell, g_win_entry_sell));
+             "ENTRY SELL (S/R): " + WinLabel(g_entry_sell, g_win_entry_sell));
 
    // --- Per-week walls ---
    if(InpShowWeekly)
@@ -439,7 +439,7 @@ void DrawLevels()
          + "Gamma Flip:  " + WinLabel(g_gamma_flip, g_win_gamma_flip) + "\n"
          + "Call Wall:   " + WinLabel(g_call_wall, g_win_call_wall) + "  (Resistance)\n"
          + "Put Wall:    " + WinLabel(g_put_wall, g_win_put_wall) + "  (Support)\n"
-         + "--- Entry Levels ---\n"
+         + "--- Entry Levels (Nearest S/R Zone) ---\n"
          + "Entry SELL:  " + WinLabel(g_entry_sell, g_win_entry_sell) + "\n"
          + "Entry BUY:   " + WinLabel(g_entry_buy, g_win_entry_buy) + "\n";
 

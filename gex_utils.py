@@ -207,7 +207,8 @@ def find_gamma_flip(df_options, spot, grid_step=0.25, pct_range=0.15):
 
 
 def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
-                                proximity_pct=None):
+                                proximity_pct=None,
+                                support_zones=None, resist_zones=None):
     """
     Generate actionable trade signals based on GEX levels.
 
@@ -215,11 +216,11 @@ def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
     -----
     **Buy signal** (bounce from put wall in negative gamma):
         1. Spot < gamma_flip  →  negative gamma regime (amplified volatility)
-        2. Spot within ``proximity_pct`` of put wall  →  near dealer support
+        2. Spot near nearest support zone (or within proximity_pct of put wall)
 
     **Sell signal** (rejection at call wall in positive gamma):
         1. Spot > gamma_flip  →  positive gamma regime (dampened, mean-reverting)
-        2. Spot within ``proximity_pct`` of call wall  →  near dealer resistance
+        2. Spot near nearest resistance zone (or within proximity_pct of call wall)
 
     **Breakout warning** (spot below put wall in negative gamma):
         Spot broke through dealer support — trend continuation expected,
@@ -231,7 +232,11 @@ def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
     gamma_flip, call_wall, put_wall : float
         GEX key levels (may be ``np.nan``).
     proximity_pct : float
-        How close spot must be to a wall to trigger a signal (default 0.5 %).
+        Fallback proximity when S/R zones are unavailable.
+    support_zones : pd.DataFrame, optional
+        GEX support zones with 'Strike' column (negative GEX strikes below spot).
+    resist_zones : pd.DataFrame, optional
+        GEX resistance zones with 'Strike' column (positive GEX strikes above spot).
 
     Returns
     -------
@@ -243,6 +248,27 @@ def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
     """
     if proximity_pct is None:
         proximity_pct = GEX_WALL_PROXIMITY_PCT
+
+    # proximity_pct sign convention:
+    #   +pct → BUY entry zone is BELOW support, SELL entry zone is ABOVE resistance
+    #   -pct → BUY entry zone is ABOVE support, SELL entry zone is BELOW resistance
+    abs_proximity = abs(proximity_pct)
+    # BUY offset: positive pct means spot must be below zone → negative offset from zone
+    buy_offset = -abs_proximity if proximity_pct >= 0 else abs_proximity
+    # SELL offset: positive pct means spot must be above zone → positive offset from zone
+    sell_offset = abs_proximity if proximity_pct >= 0 else -abs_proximity
+
+    # Derive dynamic proximity from nearest S/R zone strikes
+    nearest_support = np.nan
+    nearest_resist = np.nan
+    if support_zones is not None and not support_zones.empty:
+        below = support_zones[support_zones['Strike'] <= spot]
+        if not below.empty:
+            nearest_support = float(below['Strike'].max())
+    if resist_zones is not None and not resist_zones.empty:
+        above = resist_zones[resist_zones['Strike'] >= spot]
+        if not above.empty:
+            nearest_resist = float(above['Strike'].min())
 
     result = {
         'signal': 'NEUTRAL',
@@ -272,11 +298,22 @@ def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
     has_put_wall = np.isfinite(put_wall)
     has_call_wall = np.isfinite(call_wall)
 
-    # --- Negative gamma: look for buy at put wall or breakout ---
+    # --- Negative gamma: look for buy at put wall / support zone or breakout ---
     if result['regime'] == 'NEGATIVE_GAMMA' and has_put_wall:
         dist_to_pw = (spot - put_wall) / put_wall if put_wall != 0 else np.nan
 
-        if np.isfinite(dist_to_pw) and dist_to_pw < -proximity_pct:
+        # Use nearest support zone for proximity when available
+        if np.isfinite(nearest_support) and put_wall != 0:
+            # buy_offset < 0 → entry zone below support; > 0 → above support
+            entry_zone = nearest_support * (1.0 + buy_offset)
+            in_zone = spot <= entry_zone if buy_offset >= 0 else spot >= entry_zone
+            support_label = f'support zone ({nearest_support:.2f}, entry {entry_zone:.2f})'
+        else:
+            entry_zone = put_wall * (1.0 + buy_offset)
+            in_zone = spot <= entry_zone if buy_offset >= 0 else spot >= entry_zone
+            support_label = f'put wall ({put_wall:.2f}, entry {entry_zone:.2f})'
+
+        if np.isfinite(dist_to_pw) and dist_to_pw < buy_offset:
             # Spot broke below put wall → breakout continuation
             result['signal'] = 'BREAKOUT_DOWN'
             result['reason'] = (
@@ -284,30 +321,41 @@ def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
                 f'in negative gamma. Trend continuation expected — avoid longs.'
             )
             result['strength'] = 3
-        elif np.isfinite(dist_to_pw) and abs(dist_to_pw) <= proximity_pct:
-            # Spot near put wall → buy bounce setup
+        elif in_zone:
+            # Spot in entry zone near support → buy bounce setup
             result['signal'] = 'BUY'
             result['reason'] = (
-                f'Spot ({spot:.2f}) near put wall ({put_wall:.2f}) in '
+                f'Spot ({spot:.2f}) near {support_label} in '
                 f'negative gamma (flip at {gamma_flip:.2f}). '
                 'Dealers short gamma — high-probability bounce zone. '
                 'Confirm with 15-min reversal candle / volume spike.'
             )
             result['strength'] = 2
         else:
-            # Below flip but not near put wall yet
+            # Below flip but not near support zone yet
             result['signal'] = 'NEUTRAL'
             result['reason'] = (
                 f'Negative gamma regime (spot {spot:.2f} < flip {gamma_flip:.2f}) '
-                f'but spot not yet at put wall ({put_wall:.2f}). Wait for approach.'
+                f'but spot not yet at {support_label}. Wait for approach.'
             )
             result['strength'] = 1
 
-    # --- Positive gamma: look for sell at call wall or breakout ---
+    # --- Positive gamma: look for sell at call wall / resistance zone or breakout ---
     elif result['regime'] == 'POSITIVE_GAMMA' and has_call_wall:
         dist_to_cw = (spot - call_wall) / call_wall if call_wall != 0 else np.nan
 
-        if np.isfinite(dist_to_cw) and dist_to_cw > proximity_pct:
+        # Use nearest resistance zone for proximity when available
+        if np.isfinite(nearest_resist) and call_wall != 0:
+            # sell_offset > 0 → entry zone above resistance; < 0 → below resistance
+            entry_zone = nearest_resist * (1.0 + sell_offset)
+            in_zone = spot >= entry_zone if sell_offset >= 0 else spot <= entry_zone
+            resist_label = f'resistance zone ({nearest_resist:.2f}, entry {entry_zone:.2f})'
+        else:
+            entry_zone = call_wall * (1.0 + sell_offset)
+            in_zone = spot >= entry_zone if sell_offset >= 0 else spot <= entry_zone
+            resist_label = f'call wall ({call_wall:.2f}, entry {entry_zone:.2f})'
+
+        if np.isfinite(dist_to_cw) and dist_to_cw > abs_proximity:
             # Spot broke above call wall → breakout continuation
             result['signal'] = 'BREAKOUT_UP'
             result['reason'] = (
@@ -315,11 +363,11 @@ def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
                 f'in positive gamma. Gamma squeeze potential — trend continuation.'
             )
             result['strength'] = 3
-        elif np.isfinite(dist_to_cw) and abs(dist_to_cw) <= proximity_pct:
-            # Spot near call wall → sell / mean-reversion setup
+        elif in_zone:
+            # Spot in entry zone near resistance → sell / mean-reversion setup
             result['signal'] = 'SELL'
             result['reason'] = (
-                f'Spot ({spot:.2f}) near call wall ({call_wall:.2f}) in '
+                f'Spot ({spot:.2f}) near {resist_label} in '
                 f'positive gamma (flip at {gamma_flip:.2f}). '
                 'Dealers long gamma — mean-reversion rejection likely. '
                 'Confirm with 15-min rejection wick / volume drop.'
@@ -329,7 +377,7 @@ def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
             result['signal'] = 'NEUTRAL'
             result['reason'] = (
                 f'Positive gamma regime (spot {spot:.2f} > flip {gamma_flip:.2f}) '
-                f'but spot not yet at call wall ({call_wall:.2f}). Range-trade setup.'
+                f'but spot not yet at {resist_label}. Range-trade setup.'
             )
             result['strength'] = 1
 

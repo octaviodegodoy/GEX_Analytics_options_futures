@@ -66,6 +66,8 @@ class MT5Connector:
             else:
                 print(f"Order failed: {result.comment}")
 
+        return result
+
     def cancel_gex_pending_orders(self, symbol=None):
         """Cancel all pending orders placed by GEX (identified by GEX_MAGIC_NUMBER).
         If symbol is given, only cancel orders for that symbol."""
