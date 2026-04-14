@@ -53,6 +53,7 @@ from constants import GEX_WALL_PROXIMITY_PCT
 from constants import GEX_MIN_SL_POINTS, GEX_TRAILING_DISTANCE_FACTOR
 from constants import GEX_MAX_DAILY_LOSS_PCT, GEX_TP_AT_OPPOSITE_WALL
 from constants import GEX_TRADE_WINDOW_START, GEX_TRADE_WINDOW_END
+from constants import GEX_PRE_TRADE_REFRESH_MIN
 from gex_utils import find_gamma_flip, compute_weekly_walls, generate_gex_trade_signals
 from gex_plots import plot_notional_by_strike, plot_gex_all_expiry, plot_gex_weekly
 from b3_options_loader import load_b3_options_data
@@ -138,18 +139,40 @@ def _select_significant_zones(gex_frame, spot, top_n=3, zone_pct=0.04):
        return resist, support
 
 
-def _nearest_support_resistance(spot, support_zones, resist_zones):
-       """Return the closest support strike below spot and closest resistance strike above spot."""
-       entry_buy = np.nan
-       entry_sell = np.nan
+def _nearest_support_resistance(spot, support_zones, resist_zones,
+                                put_wall=np.nan, call_wall=np.nan,
+                                pin_candidates=None):
+       """Return the closest support strike below spot and closest resistance strike above spot.
+       Also considers pin candidate strikes (high dealer GEX = pinning magnets).
+       Falls back to put_wall / call_wall when no S/R zone is found."""
+       # Collect candidate strikes below/above spot from S/R zones + pin candidates
+       below_strikes = []
+       above_strikes = []
        if not support_zones.empty:
            below = support_zones[support_zones['Strike'] <= spot]
            if not below.empty:
-               entry_buy = float(below['Strike'].max())
+               below_strikes.extend(below['Strike'].tolist())
        if not resist_zones.empty:
            above = resist_zones[resist_zones['Strike'] >= spot]
            if not above.empty:
-               entry_sell = float(above['Strike'].min())
+               above_strikes.extend(above['Strike'].tolist())
+       # Pin candidates act as magnetic levels for both sides
+       if pin_candidates is not None and not pin_candidates.empty:
+           pin_below = pin_candidates[pin_candidates['Strike'] <= spot]
+           pin_above = pin_candidates[pin_candidates['Strike'] >= spot]
+           if not pin_below.empty:
+               below_strikes.extend(pin_below['Strike'].tolist())
+           if not pin_above.empty:
+               above_strikes.extend(pin_above['Strike'].tolist())
+
+       entry_buy = float(max(below_strikes)) if below_strikes else np.nan
+       entry_sell = float(min(above_strikes)) if above_strikes else np.nan
+
+       # Fallback to walls when S/R zones + pins don't provide a level
+       if not np.isfinite(entry_buy) and np.isfinite(put_wall):
+           entry_buy = put_wall
+       if not np.isfinite(entry_sell) and np.isfinite(call_wall):
+           entry_sell = call_wall
        return entry_buy, entry_sell
 
 
@@ -395,7 +418,8 @@ def _export_gex_csv(underlying, spot, call_wall, put_wall, gamma_flip, regime,
            rows.append(("fly_suitability", flyagonal['suitability'], "", ""))
 
        # Entry lines — closest support / resistance to spot with directional offset
-       entry_buy, entry_sell = _nearest_support_resistance(spot, support_zones, resist_zones)
+       _pin_df = pin_snapshot.get('pin_candidates', pd.DataFrame()) if pin_snapshot is not None else pd.DataFrame()
+       entry_buy, entry_sell = _nearest_support_resistance(spot, support_zones, resist_zones, put_wall=put_wall, call_wall=call_wall, pin_candidates=_pin_df)
        # Apply GEX_WALL_PROXIMITY_PCT offset:
        #   +pct → BUY zone below support, SELL zone above resistance
        #   -pct → BUY zone above support, SELL zone below resistance
@@ -806,7 +830,7 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
        # ----------------------------------------------------------------
        # GEX ENTRY LEVELS — closest support / resistance to spot + offset
        # ----------------------------------------------------------------
-       entry_buy, entry_sell = _nearest_support_resistance(spot, support_zones, resist_zones)
+       entry_buy, entry_sell = _nearest_support_resistance(spot, support_zones, resist_zones, put_wall=put_wall, call_wall=call_wall, pin_candidates=pin_snapshot.get('pin_candidates', pd.DataFrame()))
        _abs_p = abs(GEX_WALL_PROXIMITY_PCT)
        _b_off = -_abs_p if GEX_WALL_PROXIMITY_PCT >= 0 else _abs_p
        _s_off = _abs_p if GEX_WALL_PROXIMITY_PCT >= 0 else -_abs_p
@@ -863,12 +887,14 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
            'trade_signal': trade_signal,
            'support_zones': support_zones,
            'resist_zones': resist_zones,
+           'pin_candidates': pin_snapshot.get('pin_candidates', pd.DataFrame()),
        }
 
 
 async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                                 call_wall, put_wall, gamma_flip,
-                                support_zones=None, resist_zones=None):
+                                support_zones=None, resist_zones=None,
+                                pin_candidates=None):
     """
     Real-time spot price monitor for GEX entry execution.
 
@@ -890,11 +916,13 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
         support_zones = pd.DataFrame()
     if resist_zones is None:
         resist_zones = pd.DataFrame()
+    if pin_candidates is None:
+        pin_candidates = pd.DataFrame()
 
     # Use nearest support/resistance zones for entry levels
     sym_info = _mt5.symbol_info("BOVA11")
     _init_spot = (sym_info.bid + sym_info.ask) / 2.0 if sym_info else 0.0
-    entry_buy_bova, entry_sell_bova = _nearest_support_resistance(_init_spot, support_zones, resist_zones)
+    entry_buy_bova, entry_sell_bova = _nearest_support_resistance(_init_spot, support_zones, resist_zones, put_wall=put_wall, call_wall=call_wall, pin_candidates=pin_candidates)
     # Apply directional offset from GEX_WALL_PROXIMITY_PCT
     _abs_prox = abs(GEX_WALL_PROXIMITY_PCT)
     _buy_off  = -_abs_prox if GEX_WALL_PROXIMITY_PCT >= 0 else _abs_prox
@@ -913,6 +941,10 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
     # Trailing stop state per side: {entry_price, volume, best_price, trailing_active, position_ticket}
     trail_buy  = None
     trail_sell = None
+
+    # --- Compute initial margin budget (needed by reconstructed trail states) ---
+    _acct_init = _mt5.account_info()
+    margin_budget = _acct_init.margin_free * GEX_MARGIN_FREE_PCT if _acct_init else 0.0
 
     # --- Detect existing GEX positions to avoid duplicates (one per wall per magic) ---
     _existing = _mt5.positions_get(symbol=win_symbol)
@@ -937,6 +969,7 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                     'tick_sz': _tick_sz, 'tick_val': _tick_val,
                     'sl_points': _sl_pts, 'sl_price': _sl_price,
                     'dca_count': max(len(_buy_positions) - 1, 0), 'wall': 'PutWall',
+                    'margin_budget': margin_budget,
                 }
                 print(f"[GEX Monitor] Existing BUY position(s) detected — "
                       f"{len(_buy_positions)} pos, {_total_vol:.0f} vol, "
@@ -955,6 +988,7 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                     'tick_sz': _tick_sz, 'tick_val': _tick_val,
                     'sl_points': _sl_pts, 'sl_price': _sl_price,
                     'dca_count': max(len(_sell_positions) - 1, 0), 'wall': 'CallWall',
+                    'margin_budget': margin_budget,
                 }
                 print(f"[GEX Monitor] Existing SELL position(s) detected — "
                       f"{len(_sell_positions)} pos, {_total_vol:.0f} vol, "
@@ -972,10 +1006,13 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
     print(f"  Interval   : {GEX_MONITOR_INTERVAL}s")
     print(f"  Min Strength: {GEX_MIN_SIGNAL_STRENGTH}/3")
     print(f"  Trade Window: {GEX_TRADE_WINDOW_START} – {GEX_TRADE_WINDOW_END}")
+    print(f"  Pre-Trade Refresh: {GEX_PRE_TRADE_REFRESH_MIN}min before window")
     print(f"  Daily Loss Cap: {GEX_MAX_DAILY_LOSS_PCT:.0%} of budget")
     print(f"  Min SL Floor: {GEX_MIN_SL_POINTS} pts")
+    print(f"  Trailing Activation: {GEX_TRAILING_ACTIVATION_PCT:.0%} of budget = R${margin_budget * GEX_TRAILING_ACTIVATION_PCT:,.2f}")
     print(f"  Trailing Factor: {GEX_TRAILING_DISTANCE_FACTOR:.0%} of SL")
     print(f"  TP at Opposite Wall: {'Yes' if GEX_TP_AT_OPPOSITE_WALL else 'No'}")
+    print(f"  Budget     : R${margin_budget:,.2f} ({GEX_MARGIN_FREE_PCT:.1%} of margin_free)")
     print(f"  RTD Refresh : {'every ' + str(GEX_RTD_REFRESH_INTERVAL) + 's' if GEX_RTD_REFRESH_INTERVAL > 0 else 'disabled'}")
     print(f"{'='*75}")
     print(f"  Press Ctrl+C to stop monitoring.\n")
@@ -991,9 +1028,66 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
     win_tp_buy = win_mapper.bova11_to_ind(call_wall) if np.isfinite(call_wall) else np.nan
     win_tp_sell = win_mapper.bova11_to_ind(put_wall) if np.isfinite(put_wall) else np.nan
 
+    # Pre-trade GEX refresh: recalculate levels N minutes before trading window
+    _pre_trade_h, _pre_trade_m = map(int, GEX_TRADE_WINDOW_START.split(":"))
+    _pre_trade_total_min = _pre_trade_h * 60 + _pre_trade_m - GEX_PRE_TRADE_REFRESH_MIN
+    _pre_trade_time = f"{_pre_trade_total_min // 60:02d}:{_pre_trade_total_min % 60:02d}"
+    _pre_trade_refreshed = False
+    _waiting_msg_printed = False
+
     tick_count = 0
     try:
         while True:
+            # --- Pre-trade GEX refresh: recalculate levels before trading window ---
+            _now_hm = _dt.now().strftime("%H:%M")
+            if (not _pre_trade_refreshed
+                    and _pre_trade_time <= _now_hm < GEX_TRADE_WINDOW_START):
+                _pre_trade_refreshed = True
+                ts_now = _dt.now().strftime("%H:%M:%S")
+                print(f"\n[{ts_now}] [PRE-TRADE] {GEX_PRE_TRADE_REFRESH_MIN}min before trading window — recalculating GEX levels...")
+                try:
+                    sym_info = _mt5.symbol_info("BOVA11")
+                    _pt_spot = (sym_info.bid + sym_info.ask) / 2.0 if sym_info else 0.0
+                    if _pt_spot > 0:
+                        _pt_result = await analyze_options(
+                            _pt_spot, "BOVA11",
+                            win_mapper=win_mapper,
+                            win_symbol=win_symbol,
+                            mt5_conn=mt5_conn,
+                        )
+                        if _pt_result is not None:
+                            old_cw, old_pw, old_gf = call_wall, put_wall, gamma_flip
+                            call_wall = _pt_result['call_wall']
+                            put_wall = _pt_result['put_wall']
+                            gamma_flip = _pt_result['gamma_flip']
+
+                            support_zones = _pt_result.get('support_zones', pd.DataFrame())
+                            resist_zones = _pt_result.get('resist_zones', pd.DataFrame())
+                            pin_candidates = _pt_result.get('pin_candidates', pd.DataFrame())
+                            entry_buy_bova, entry_sell_bova = _nearest_support_resistance(_pt_spot, support_zones, resist_zones, put_wall=put_wall, call_wall=call_wall, pin_candidates=pin_candidates)
+                            if np.isfinite(entry_buy_bova):
+                                entry_buy_bova = entry_buy_bova * (1.0 + _buy_off)
+                            if np.isfinite(entry_sell_bova):
+                                entry_sell_bova = entry_sell_bova * (1.0 + _sell_off)
+                            win_entry_buy = win_mapper.bova11_to_ind(entry_buy_bova) if np.isfinite(entry_buy_bova) else np.nan
+                            win_entry_sell = win_mapper.bova11_to_ind(entry_sell_bova) if np.isfinite(entry_sell_bova) else np.nan
+                            win_tp_buy = win_mapper.bova11_to_ind(call_wall) if np.isfinite(call_wall) else np.nan
+                            win_tp_sell = win_mapper.bova11_to_ind(put_wall) if np.isfinite(put_wall) else np.nan
+
+                            print(f"[{ts_now}] [PRE-TRADE] GEX REFRESHED")
+                            print(f"  Call Wall : {old_cw:.2f} → {call_wall:.2f}" if np.isfinite(call_wall) else f"  Call Wall : N/A")
+                            print(f"  Put Wall  : {old_pw:.2f} → {put_wall:.2f}" if np.isfinite(put_wall) else f"  Put Wall  : N/A")
+                            print(f"  Gamma Flip: {old_gf:.2f} → {gamma_flip:.2f}" if np.isfinite(gamma_flip) else f"  Gamma Flip: N/A")
+                            print(f"  Entry BUY : {entry_buy_bova:.2f} → {win_entry_buy:.0f} (WIN)" if np.isfinite(entry_buy_bova) else f"  Entry BUY : N/A")
+                            print(f"  Entry SELL: {entry_sell_bova:.2f} → {win_entry_sell:.0f} (WIN)" if np.isfinite(entry_sell_bova) else f"  Entry SELL: N/A")
+                        else:
+                            print(f"[{ts_now}] [PRE-TRADE] Reanalysis returned nothing — keeping old levels")
+                    else:
+                        print(f"[{ts_now}] [PRE-TRADE] BOVA11 spot unavailable — keeping old levels")
+                except Exception as e:
+                    ts_now = _dt.now().strftime("%H:%M:%S")
+                    print(f"[{ts_now}] [PRE-TRADE] Refresh failed: {e} — keeping old levels")
+
             # --- RTD OI refresh: recalculate GEX when Profit Pro updates the file ---
             if GEX_RTD_REFRESH_INTERVAL > 0:
                 now_mono = _time.monotonic()
@@ -1021,7 +1115,8 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                                     # Recompute entry levels from updated zones
                                     support_zones = rtd_result.get('support_zones', pd.DataFrame())
                                     resist_zones = rtd_result.get('resist_zones', pd.DataFrame())
-                                    entry_buy_bova, entry_sell_bova = _nearest_support_resistance(rtd_spot, support_zones, resist_zones)
+                                    pin_candidates = rtd_result.get('pin_candidates', pd.DataFrame())
+                                    entry_buy_bova, entry_sell_bova = _nearest_support_resistance(rtd_spot, support_zones, resist_zones, put_wall=put_wall, call_wall=call_wall, pin_candidates=pin_candidates)
                                     # Apply directional offset
                                     if np.isfinite(entry_buy_bova):
                                         entry_buy_bova = entry_buy_bova * (1.0 + _buy_off)
@@ -1045,6 +1140,18 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                 open_gex = _mt5.positions_get(symbol=win_symbol)
                 if not any(p.magic == GEX_MAGIC_NUMBER for p in (open_gex or [])):
                     break
+
+            # Before trading window: print waiting message and skip tick logging
+            _now_hm_chk = _dt.now().strftime("%H:%M")
+            if _now_hm_chk < GEX_TRADE_WINDOW_START:
+                if not _waiting_msg_printed:
+                    _waiting_msg_printed = True
+                    print(f"[{_dt.now().strftime('%H:%M:%S')}] Waiting for trading window "
+                          f"({GEX_TRADE_WINDOW_START}) to begin...")
+                    if _pre_trade_time > _now_hm_chk:
+                        print(f"  Pre-trade GEX refresh scheduled at {_pre_trade_time}")
+                await asyncio.sleep(GEX_MONITOR_INTERVAL)
+                continue
 
             tick = _mt5.symbol_info_tick(win_symbol)
             if tick is None:
@@ -1157,6 +1264,7 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                         sl=sl_price,
                         tp=tp_price,
                     )
+                    _entry_budget = margin_budget  # freeze budget at entry time
                     if result is not None and hasattr(result, 'retcode') and result.retcode == _mt5.TRADE_RETCODE_DONE:
                         buy_executed = True
                         trail_buy = {
@@ -1165,8 +1273,12 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                             'tick_sz': tick_sz, 'tick_val': tick_val,
                             'sl_points': sl_points, 'sl_price': sl_price,
                             'dca_count': 0, 'wall': 'PutWall',
+                            'margin_budget': _entry_budget,
                         }
+                        _trail_activation = _entry_budget * GEX_TRAILING_ACTIVATION_PCT
                         print(f"[GEX Monitor] BUY FILLED — {vol} contracts, order #{result.order}")
+                        print(f"       [Trailing] activates at R${_trail_activation:,.2f} profit "
+                              f"({GEX_TRAILING_ACTIVATION_PCT:.0%} of R${_entry_budget:,.2f} budget)")
                         _dca1_step = margin_budget * GEX_DCA_LOSS_STEP_PCT
                         _pnl_pt = vol * (tick_val / tick_sz) if tick_sz > 0 else 0
                         if _pnl_pt > 0:
@@ -1185,6 +1297,7 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                             'tick_sz': tick_sz, 'tick_val': tick_val,
                             'sl_points': sl_points, 'sl_price': sl_price,
                             'dca_count': 0, 'wall': 'PutWall',
+                            'margin_budget': _entry_budget,
                         }
                         print()
 
@@ -1234,6 +1347,7 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                         sl=sl_price,
                         tp=tp_price,
                     )
+                    _entry_budget = margin_budget  # freeze budget at entry time
                     if result is not None and hasattr(result, 'retcode') and result.retcode == _mt5.TRADE_RETCODE_DONE:
                         sell_executed = True
                         trail_sell = {
@@ -1242,8 +1356,12 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                             'tick_sz': tick_sz, 'tick_val': tick_val,
                             'sl_points': sl_points, 'sl_price': sl_price,
                             'dca_count': 0, 'wall': 'CallWall',
+                            'margin_budget': _entry_budget,
                         }
+                        _trail_activation = _entry_budget * GEX_TRAILING_ACTIVATION_PCT
                         print(f"[GEX Monitor] SELL FILLED — {vol} contracts, order #{result.order}")
+                        print(f"       [Trailing] activates at R${_trail_activation:,.2f} profit "
+                              f"({GEX_TRAILING_ACTIVATION_PCT:.0%} of R${_entry_budget:,.2f} budget)")
                         _dca1_step = margin_budget * GEX_DCA_LOSS_STEP_PCT
                         _pnl_pt = vol * (tick_val / tick_sz) if tick_sz > 0 else 0
                         if _pnl_pt > 0:
@@ -1262,13 +1380,12 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                             'tick_sz': tick_sz, 'tick_val': tick_val,
                             'sl_points': sl_points, 'sl_price': sl_price,
                             'dca_count': 0, 'wall': 'CallWall',
+                            'margin_budget': _entry_budget,
                         }
                         print()
 
             # ---- Trailing stop management for open GEX positions ----
             # Process each side (BUY / SELL) once, aggregating all positions
-            activation_r = margin_budget * GEX_TRAILING_ACTIVATION_PCT
-
             positions = _mt5.positions_get(symbol=win_symbol)
             gex_positions = [p for p in (positions or []) if p.magic == GEX_MAGIC_NUMBER]
 
@@ -1283,6 +1400,10 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                 trail = trail_buy if is_buy else trail_sell
                 if trail is None:
                     continue
+
+                # Use the frozen budget from entry time (not the live margin_budget)
+                _trail_budget = trail.get('margin_budget', margin_budget)
+                activation_r = _trail_budget * GEX_TRAILING_ACTIVATION_PCT
 
                 tk_sz = trail['tick_sz']
                 tk_val = trail['tick_val']
@@ -1301,6 +1422,13 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                     profit_pts = trail['entry'] - trail['best']
 
                 profit_r = profit_pts * pnl_per_pt
+
+                # Log trailing progress every tick when position is open
+                _pct_to_activation = (profit_r / activation_r * 100) if activation_r > 0 else 0
+                if not trail['active']:
+                    print(f"       [Trail] {side_key} profit R${profit_r:,.2f} / "
+                          f"R${activation_r:,.2f} ({_pct_to_activation:.0f}%) "
+                          f"| best {trail['best']:.0f}")
 
                 if not trail['active'] and profit_r >= activation_r:
                     trail['active'] = True
@@ -1604,6 +1732,7 @@ async def main():
             gamma_flip=bova11_gex['gamma_flip'],
             support_zones=bova11_gex.get('support_zones'),
             resist_zones=bova11_gex.get('resist_zones'),
+            pin_candidates=bova11_gex.get('pin_candidates'),
         )
     elif GEX_MONITOR_ENABLED:
         reasons = []
