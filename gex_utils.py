@@ -381,7 +381,24 @@ def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
             )
             result['strength'] = 1
 
-    else:
-        result['reason'] = 'Missing wall data for signal generation.'
+    # --- Gamma-flip bounce: positive gamma, spot between walls, near flip ---
+    # When the primary signal is NEUTRAL strength=1 and spot is approaching
+    # the gamma flip from above (within 0.5%), dealers will actively defend
+    # the flip → high-probability long entry with reduced conviction.
+    if (result['signal'] == 'NEUTRAL' and result['strength'] == 1
+            and result['regime'] == 'POSITIVE_GAMMA'
+            and has_put_wall and has_call_wall):
+        flip_proximity = (spot - gamma_flip) / gamma_flip if gamma_flip != 0 else np.nan
+        if np.isfinite(flip_proximity) and 0 < flip_proximity <= 0.005:
+            result['signal'] = 'BUY'
+            result['reason'] = (
+                f'Spot ({spot:.2f}) within 0.5% above gamma flip ({gamma_flip:.2f}) '
+                f'in positive gamma. Dealers defend flip — bounce setup. '
+                'Reduced size recommended (gamma-flip proximity trade).'
+            )
+            result['strength'] = 2
+
+    if result['signal'] == 'NEUTRAL' and result['strength'] <= 1:
+        result['reason'] += ' Missing wall data for signal generation.' if 'Missing' not in result['reason'] else ''
 
     return result

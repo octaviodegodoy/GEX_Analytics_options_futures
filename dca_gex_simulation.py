@@ -19,6 +19,9 @@ from constants import (
     GEX_DCA_MAX_ORDERS,
     GEX_ORDER_VOLUME,
     GEX_MIN_SIGNAL_STRENGTH,
+    GEX_MIN_SL_POINTS,
+    GEX_TRAILING_DISTANCE_FACTOR,
+    GEX_WALL_PROXIMITY_PCT,
 )
 
 # ── WIN Contract Specifications ──────────────────────────────────────
@@ -75,6 +78,7 @@ def compute_sl(entry_price, vol, is_buy):
     risk_r = MARGIN_BUDGET * GEX_SL_RISK_PCT
     sl_points = (risk_r / vol) / PNL_PER_POINT if vol > 0 else 0.0
     sl_points = round(sl_points / TICK_SIZE) * TICK_SIZE
+    sl_points = max(sl_points, GEX_MIN_SL_POINTS)  # enforce minimum SL floor
     if is_buy:
         return align_tick(entry_price - sl_points), sl_points
     else:
@@ -197,7 +201,7 @@ def simulate_scenario(entry_price, is_buy, target_pct, label):
                 levels_crossed = int(loss_r / dca_step_r) if dca_step_r > 0 else 0
                 needed = levels_crossed - dca_count
 
-                for _ in range(needed):
+                while needed > 0:
                     if dca_count >= GEX_DCA_MAX_ORDERS:
                         break
                     fib_idx = min(dca_count, len(FIB_SEQ) - 1)
@@ -218,6 +222,14 @@ def simulate_scenario(entry_price, is_buy, target_pct, label):
                     pnl_per_pt_new = new_total * PNL_PER_POINT
                     new_sl_dist = (risk_r / pnl_per_pt_new) if pnl_per_pt_new > 0 else 0.0
                     new_sl_dist = round(new_sl_dist / TICK_SIZE) * TICK_SIZE
+                    new_sl_dist = max(new_sl_dist, GEX_MIN_SL_POINTS)  # enforce minimum SL floor
+
+                    # Risk guard: skip DCA if min SL floor causes actual risk > 2× budget
+                    actual_risk = new_sl_dist * pnl_per_pt_new
+                    if actual_risk > risk_r * 2:
+                        events.append(('DCA_SKIPPED_RISK', step, price, actual_risk, total_vol, dca_count))
+                        break
+
                     if is_buy:
                         current_sl = align_tick(new_avg - new_sl_dist)
                     else:
@@ -242,6 +254,15 @@ def simulate_scenario(entry_price, is_buy, target_pct, label):
                     })
                     events.append(('DCA', step, price, new_pnl_r, total_vol, dca_count))
 
+                    # Recalculate loss & needed after avg entry changed
+                    if is_buy:
+                        loss_pts = avg_entry - price
+                    else:
+                        loss_pts = price - avg_entry
+                    loss_r = loss_pts * total_vol * PNL_PER_POINT
+                    levels_crossed = int(loss_r / dca_step_r) if dca_step_r > 0 else 0
+                    needed = levels_crossed - dca_count
+
         # ── Trailing stop activation ─────────────────────────
         if is_buy:
             profit_pts = best_price - avg_entry
@@ -256,12 +277,15 @@ def simulate_scenario(entry_price, is_buy, target_pct, label):
             events.append(('TRAIL_ACTIVATED', step, price, profit_r, total_vol, dca_count))
 
         if trailing_active:
+            # Use tighter trailing distance (factor of original SL)
+            trail_dist = sl_points * GEX_TRAILING_DISTANCE_FACTOR
+            trail_dist = max(trail_dist, GEX_MIN_SL_POINTS)  # never below floor
             if is_buy:
-                new_sl = align_tick(best_price - sl_points)
+                new_sl = align_tick(best_price - trail_dist)
                 if new_sl > current_sl:
                     current_sl = new_sl
             else:
-                new_sl = align_tick(best_price + sl_points)
+                new_sl = align_tick(best_price + trail_dist)
                 if new_sl < current_sl:
                     current_sl = new_sl
 

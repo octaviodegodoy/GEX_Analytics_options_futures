@@ -26,6 +26,9 @@ from constants import (
     GEX_MARGIN_FREE_PCT, GEX_SL_RISK_PCT, GEX_TRAILING_ACTIVATION_PCT,
     GEX_DCA_LOSS_STEP_PCT, GEX_DCA_MAX_ORDERS, GEX_ORDER_VOLUME,
     GEX_WALL_PROXIMITY_PCT, GEX_MIN_SIGNAL_STRENGTH,
+    GEX_MIN_SL_POINTS, GEX_TRAILING_DISTANCE_FACTOR,
+    GEX_MAX_DAILY_LOSS_PCT, GEX_TP_AT_OPPOSITE_WALL,
+    GEX_TRADE_WINDOW_START, GEX_TRADE_WINDOW_END,
 )
 from gex_utils import compute_weekly_walls, find_gamma_flip, generate_gex_trade_signals
 from main import _select_significant_zones
@@ -125,6 +128,12 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
         entry_sell_bova = call_wall_bova * (1.0 - GEX_WALL_PROXIMITY_PCT) if np.isfinite(call_wall_bova) else np.nan
 
     trades = []  # list of completed trade dicts
+    daily_realized_pnl = 0.0  # track daily loss for circuit breaker
+    daily_loss_limit = MARGIN_BUDGET * GEX_MAX_DAILY_LOSS_PCT
+
+    # TP levels in WIN terms (opposite wall)
+    win_tp_buy = win_call_wall  # BUY exits at call wall
+    win_tp_sell = win_put_wall  # SELL exits at put wall
 
     # Per-side state
     for side_label, is_buy, entry_bova in [
@@ -132,6 +141,9 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
         ('SELL', False, entry_sell_bova)
     ]:
         if not np.isfinite(entry_bova):
+            continue
+        # Daily loss circuit breaker
+        if daily_realized_pnl <= -daily_loss_limit:
             continue
 
         executed = False
@@ -149,6 +161,11 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
 
             # ── Check entry ──────────────────────────────────
             if not executed:
+                # Time window filter
+                bar_time_hm = bar['time'].strftime("%H:%M") if hasattr(bar['time'], 'strftime') else "00:00"
+                if not (GEX_TRADE_WINDOW_START <= bar_time_hm <= GEX_TRADE_WINDOW_END):
+                    continue
+
                 trigger = False
                 if is_buy and sig == 'BUY' and strength >= GEX_MIN_SIGNAL_STRENGTH:
                     trigger = True
@@ -161,16 +178,23 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
                     vol = vol_initial
                     sl_dist = (risk_r / vol) / PNL_PER_POINT if vol > 0 else 0
                     sl_dist = round(sl_dist / TICK_SIZE) * TICK_SIZE
+                    sl_dist = max(sl_dist, GEX_MIN_SL_POINTS)  # enforce minimum SL floor
                     if is_buy:
                         sl_price = align_tick(entry_price - sl_dist)
                     else:
                         sl_price = align_tick(entry_price + sl_dist)
+
+                    # TP at opposite wall
+                    tp_price = np.nan
+                    if GEX_TP_AT_OPPOSITE_WALL:
+                        tp_price = win_tp_buy if is_buy else win_tp_sell
 
                     trail = {
                         'entry': entry_price, 'avg_entry': entry_price,
                         'vol': vol, 'total_vol': vol,
                         'best': entry_price, 'active': False,
                         'sl_dist': sl_dist, 'sl_price': sl_price,
+                        'tp_price': tp_price,
                         'dca_count': 0, 'entry_time': bar['time'],
                         'positions': [{'entry': entry_price, 'vol': vol, 'label': 'Initial'}],
                     }
@@ -210,6 +234,7 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
                 else:
                     pnl_pts = avg - exit_price
                 pnl_r = pnl_pts * tvol * PNL_PER_POINT
+                daily_realized_pnl += pnl_r
 
                 trades.append({
                     'day': day_label, 'side': side_label,
@@ -219,6 +244,39 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
                     'vol': tvol, 'dca': trail['dca_count'],
                     'pnl_pts': pnl_pts, 'pnl_r': pnl_r,
                     'exit_type': 'STOP',
+                    'trailing': trail['active'],
+                    'call_wall': call_wall_bova, 'put_wall': put_wall_bova,
+                    'gamma_flip': gamma_flip_bova,
+                })
+                break
+
+            # ── TP check (opposite wall) ─────────────────────
+            tp_hit = False
+            tp = trail.get('tp_price', np.nan)
+            if np.isfinite(tp):
+                if is_buy and best_price >= tp:
+                    tp_hit = True
+                    exit_price = align_tick(tp)
+                elif not is_buy and best_price <= tp:
+                    tp_hit = True
+                    exit_price = align_tick(tp)
+
+            if tp_hit:
+                if is_buy:
+                    pnl_pts = exit_price - avg
+                else:
+                    pnl_pts = avg - exit_price
+                pnl_r = pnl_pts * tvol * PNL_PER_POINT
+                daily_realized_pnl += pnl_r
+
+                trades.append({
+                    'day': day_label, 'side': side_label,
+                    'entry': trail['entry'], 'avg_entry': avg,
+                    'exit': exit_price, 'exit_time': bar['time'],
+                    'entry_time': trail['entry_time'],
+                    'vol': tvol, 'dca': trail['dca_count'],
+                    'pnl_pts': pnl_pts, 'pnl_r': pnl_r,
+                    'exit_type': 'TP',
                     'trailing': trail['active'],
                     'call_wall': call_wall_bova, 'put_wall': put_wall_bova,
                     'gamma_flip': gamma_flip_bova,
@@ -236,7 +294,7 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
                 if loss_r > 0:
                     levels_crossed = int(loss_r / dca_step_r) if dca_step_r > 0 else 0
                     needed = levels_crossed - trail['dca_count']
-                    for _ in range(needed):
+                    while needed > 0:
                         if trail['dca_count'] >= GEX_DCA_MAX_ORDERS:
                             break
                         fib_idx = min(trail['dca_count'], len(FIB_SEQ) - 1)
@@ -256,6 +314,13 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
                         pnl_per_pt_new = new_total * PNL_PER_POINT
                         new_sl_dist = (risk_r / pnl_per_pt_new) if pnl_per_pt_new > 0 else 0
                         new_sl_dist = round(new_sl_dist / TICK_SIZE) * TICK_SIZE
+                        new_sl_dist = max(new_sl_dist, GEX_MIN_SL_POINTS)  # enforce minimum SL floor
+
+                        # Risk guard: skip DCA if min SL floor causes actual risk > 2× budget
+                        actual_risk = new_sl_dist * pnl_per_pt_new
+                        if actual_risk > risk_r * 2:
+                            break
+
                         if is_buy:
                             new_sl = align_tick(new_avg - new_sl_dist)
                         else:
@@ -273,6 +338,15 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
                         avg = new_avg
                         tvol = new_total
 
+                        # Recalculate loss & needed after avg entry changed
+                        if is_buy:
+                            loss_pts = avg - check_price
+                        else:
+                            loss_pts = check_price - avg
+                        loss_r = loss_pts * tvol * PNL_PER_POINT
+                        levels_crossed = int(loss_r / dca_step_r) if dca_step_r > 0 else 0
+                        needed = levels_crossed - trail['dca_count']
+
             # ── Trailing activation ──────────────────────────
             if is_buy:
                 profit_pts = trail['best'] - avg
@@ -284,12 +358,15 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
                 trail['active'] = True
 
             if trail['active']:
+                # Use tighter trailing distance (factor of original SL)
+                trail_dist = trail['sl_dist'] * GEX_TRAILING_DISTANCE_FACTOR
+                trail_dist = max(trail_dist, GEX_MIN_SL_POINTS)  # never below floor
                 if is_buy:
-                    new_sl = align_tick(trail['best'] - trail['sl_dist'])
+                    new_sl = align_tick(trail['best'] - trail_dist)
                     if new_sl > trail['sl_price']:
                         trail['sl_price'] = new_sl
                 else:
-                    new_sl = align_tick(trail['best'] + trail['sl_dist'])
+                    new_sl = align_tick(trail['best'] + trail_dist)
                     if new_sl < trail['sl_price']:
                         trail['sl_price'] = new_sl
 
@@ -381,9 +458,14 @@ def main():
     print(f"  Parameters:")
     print(f"    Margin Budget     = R$ {MARGIN_BUDGET:,.2f} ({GEX_MARGIN_FREE_PCT:.0%} of R${FREE_MARGIN:,.0f})")
     print(f"    SL Risk           = R$ {MARGIN_BUDGET * GEX_SL_RISK_PCT:,.2f} ({GEX_SL_RISK_PCT:.0%})")
+    print(f"    Min SL Floor      = {GEX_MIN_SL_POINTS} pts")
     print(f"    DCA Step          = R$ {MARGIN_BUDGET * GEX_DCA_LOSS_STEP_PCT:,.2f} ({GEX_DCA_LOSS_STEP_PCT:.0%})")
-    print(f"    Trailing Activate = R$ {MARGIN_BUDGET * GEX_TRAILING_ACTIVATION_PCT:,.2f} ({GEX_TRAILING_ACTIVATION_PCT:.0%})")
     print(f"    DCA Max Orders    = {GEX_DCA_MAX_ORDERS}")
+    print(f"    Trailing Activate = R$ {MARGIN_BUDGET * GEX_TRAILING_ACTIVATION_PCT:,.2f} ({GEX_TRAILING_ACTIVATION_PCT:.0%})")
+    print(f"    Trailing Factor   = {GEX_TRAILING_DISTANCE_FACTOR:.0%} of SL")
+    print(f"    TP at Opp. Wall   = {'Yes' if GEX_TP_AT_OPPOSITE_WALL else 'No'}")
+    print(f"    Daily Loss Cap    = {GEX_MAX_DAILY_LOSS_PCT:.0%} of budget")
+    print(f"    Trade Window      = {GEX_TRADE_WINDOW_START} - {GEX_TRADE_WINDOW_END}")
     print(f"    Fib Sequence      = {FIB_SEQ[:GEX_DCA_MAX_ORDERS]}")
     print(f"    Wall Proximity    = {GEX_WALL_PROXIMITY_PCT:.1%}")
     print(f"{'='*80}\n")

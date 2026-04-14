@@ -50,6 +50,9 @@ from constants import GEX_MARGIN_FREE_PCT, GEX_SL_RISK_PCT, GEX_TRAILING_ACTIVAT
 from constants import GEX_DCA_LOSS_STEP_PCT, GEX_DCA_MAX_ORDERS
 from constants import GEX_RTD_REFRESH_INTERVAL
 from constants import GEX_WALL_PROXIMITY_PCT
+from constants import GEX_MIN_SL_POINTS, GEX_TRAILING_DISTANCE_FACTOR
+from constants import GEX_MAX_DAILY_LOSS_PCT, GEX_TP_AT_OPPOSITE_WALL
+from constants import GEX_TRADE_WINDOW_START, GEX_TRADE_WINDOW_END
 from gex_utils import find_gamma_flip, compute_weekly_walls, generate_gex_trade_signals
 from gex_plots import plot_notional_by_strike, plot_gex_all_expiry, plot_gex_weekly
 from b3_options_loader import load_b3_options_data
@@ -968,12 +971,25 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
     print(f"  Volume     : {GEX_ORDER_VOLUME}")
     print(f"  Interval   : {GEX_MONITOR_INTERVAL}s")
     print(f"  Min Strength: {GEX_MIN_SIGNAL_STRENGTH}/3")
+    print(f"  Trade Window: {GEX_TRADE_WINDOW_START} – {GEX_TRADE_WINDOW_END}")
+    print(f"  Daily Loss Cap: {GEX_MAX_DAILY_LOSS_PCT:.0%} of budget")
+    print(f"  Min SL Floor: {GEX_MIN_SL_POINTS} pts")
+    print(f"  Trailing Factor: {GEX_TRAILING_DISTANCE_FACTOR:.0%} of SL")
+    print(f"  TP at Opposite Wall: {'Yes' if GEX_TP_AT_OPPOSITE_WALL else 'No'}")
     print(f"  RTD Refresh : {'every ' + str(GEX_RTD_REFRESH_INTERVAL) + 's' if GEX_RTD_REFRESH_INTERVAL > 0 else 'disabled'}")
     print(f"{'='*75}")
     print(f"  Press Ctrl+C to stop monitoring.\n")
 
     # RTD OI refresh state
     _rtd_last_check = _time.monotonic()
+
+    # Daily loss tracking — halt new entries when exceeded
+    _daily_realized_pnl = 0.0
+    _daily_loss_limit = margin_budget * GEX_MAX_DAILY_LOSS_PCT
+
+    # TP levels (WIN prices) — opposite wall for each side
+    win_tp_buy = win_mapper.bova11_to_ind(call_wall) if np.isfinite(call_wall) else np.nan
+    win_tp_sell = win_mapper.bova11_to_ind(put_wall) if np.isfinite(put_wall) else np.nan
 
     tick_count = 0
     try:
@@ -1086,13 +1102,19 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                           f"next @ {_dca_price:.0f} (R${_next_level:,.2f} loss) | "
                           f"current R${_cur_loss_r:,.2f} | R${max(_remaining, 0):,.2f} to go")
 
+            # --- Time window & daily loss gate for new entries ---
+            _now_hm = _dt.now().strftime("%H:%M")
+            _in_trade_window = GEX_TRADE_WINDOW_START <= _now_hm <= GEX_TRADE_WINDOW_END
+            _daily_loss_ok = _daily_realized_pnl > -_daily_loss_limit
+
             # --- Execute BUY ---
             # Fibonacci DCA multipliers — precompute total to size initial volume
             _fib = [1, 1, 2, 3, 5, 8, 13, 21]
             _fib_total = 1 + sum(_fib[:GEX_DCA_MAX_ORDERS])  # initial(1×) + all DCA
 
             if (sig == 'BUY' and strength >= GEX_MIN_SIGNAL_STRENGTH
-                    and not buy_executed and np.isfinite(win_entry_buy)):
+                    and not buy_executed and np.isfinite(win_entry_buy)
+                    and _in_trade_window and _daily_loss_ok):
                 # Guard: skip if a BUY position with this magic already exists
                 _live = _mt5.positions_get(symbol=win_symbol)
                 if any(p.magic == GEX_MAGIC_NUMBER and p.type == _mt5.POSITION_TYPE_BUY
@@ -1117,9 +1139,13 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                     risk_r = margin_budget * GEX_SL_RISK_PCT
                     sl_points = (risk_r / vol) / (tick_val / tick_sz) if vol > 0 and tick_val > 0 else 0.0
                     sl_points = round(sl_points / tick_sz) * tick_sz  # align to tick
-                    sl_price = tick.ask - sl_points if sl_points > 0 else 0.0
+                    sl_points = max(sl_points, GEX_MIN_SL_POINTS)    # enforce minimum SL floor
+                    sl_price = round(round((tick.ask - sl_points) / tick_sz) * tick_sz, 0) if sl_points > 0 else 0.0
+                    # TP at opposite wall (call wall for BUY)
+                    tp_price = round(round(win_tp_buy / tick_sz) * tick_sz, 0) if GEX_TP_AT_OPPOSITE_WALL and np.isfinite(win_tp_buy) else 0.0
                     print(f"\n[GEX Monitor] *** BUY TRIGGERED @ {tick.ask:.0f} | {vol} contracts "
-                          f"(budget R${margin_budget:,.2f} [{GEX_MARGIN_FREE_PCT:.1%} free], margin R${total_margin:,.2f}, SL {sl_price:.0f}, risk R${risk_r:,.2f}) ***")
+                          f"(budget R${margin_budget:,.2f} [{GEX_MARGIN_FREE_PCT:.1%} free], margin R${total_margin:,.2f}, "
+                          f"SL {sl_price:.0f}, TP {tp_price:.0f}, risk R${risk_r:,.2f}) ***")
                     result = mt5_conn.place_order(
                         symbol=win_symbol,
                         order_type=_mt5.ORDER_TYPE_BUY,
@@ -1129,6 +1155,7 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                         comment=f"GEX BUY {vol}x PutWall {put_wall:.2f}",
                         magic=GEX_MAGIC_NUMBER,
                         sl=sl_price,
+                        tp=tp_price,
                     )
                     if result is not None and hasattr(result, 'retcode') and result.retcode == _mt5.TRADE_RETCODE_DONE:
                         buy_executed = True
@@ -1163,7 +1190,8 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
 
             # --- Execute SELL ---
             elif (sig == 'SELL' and strength >= GEX_MIN_SIGNAL_STRENGTH
-                      and not sell_executed and np.isfinite(win_entry_sell)):
+                      and not sell_executed and np.isfinite(win_entry_sell)
+                      and _in_trade_window and _daily_loss_ok):
                 # Guard: skip if a SELL position with this magic already exists
                 _live = _mt5.positions_get(symbol=win_symbol)
                 if any(p.magic == GEX_MAGIC_NUMBER and p.type == _mt5.POSITION_TYPE_SELL
@@ -1188,9 +1216,13 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                     risk_r = margin_budget * GEX_SL_RISK_PCT
                     sl_points = (risk_r / vol) / (tick_val / tick_sz) if vol > 0 and tick_val > 0 else 0.0
                     sl_points = round(sl_points / tick_sz) * tick_sz  # align to tick
-                    sl_price = tick.bid + sl_points if sl_points > 0 else 0.0
+                    sl_points = max(sl_points, GEX_MIN_SL_POINTS)    # enforce minimum SL floor
+                    sl_price = round(round((tick.bid + sl_points) / tick_sz) * tick_sz, 0) if sl_points > 0 else 0.0
+                    # TP at opposite wall (put wall for SELL)
+                    tp_price = round(round(win_tp_sell / tick_sz) * tick_sz, 0) if GEX_TP_AT_OPPOSITE_WALL and np.isfinite(win_tp_sell) else 0.0
                     print(f"\n[GEX Monitor] *** SELL TRIGGERED @ {tick.bid:.0f} | {vol} contracts "
-                          f"(budget R${margin_budget:,.2f} [{GEX_MARGIN_FREE_PCT:.1%} free], margin R${total_margin:,.2f}, SL {sl_price:.0f}, risk R${risk_r:,.2f}) ***")
+                          f"(budget R${margin_budget:,.2f} [{GEX_MARGIN_FREE_PCT:.1%} free], margin R${total_margin:,.2f}, "
+                          f"SL {sl_price:.0f}, TP {tp_price:.0f}, risk R${risk_r:,.2f}) ***")
                     result = mt5_conn.place_order(
                         symbol=win_symbol,
                         order_type=_mt5.ORDER_TYPE_SELL,
@@ -1200,6 +1232,7 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                         comment=f"GEX SELL {vol}x CallWall {call_wall:.2f}",
                         magic=GEX_MAGIC_NUMBER,
                         sl=sl_price,
+                        tp=tp_price,
                     )
                     if result is not None and hasattr(result, 'retcode') and result.retcode == _mt5.TRADE_RETCODE_DONE:
                         sell_executed = True
@@ -1277,12 +1310,14 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                           f"({len(same_side)} positions, {total_vol:.0f} contracts)")
 
                 if trail['active']:
-                    # Trail SL behind the best price by the original SL distance
+                    # Trail SL at tighter distance (factor of original SL)
+                    trail_dist = trail['sl_points'] * GEX_TRAILING_DISTANCE_FACTOR
+                    trail_dist = max(trail_dist, GEX_MIN_SL_POINTS)  # never below floor
                     if is_buy:
-                        new_sl = trail['best'] - trail['sl_points']
+                        new_sl = trail['best'] - trail_dist
                         new_sl = round(round(new_sl / tk_sz) * tk_sz, 0)
                     else:
-                        new_sl = trail['best'] + trail['sl_points']
+                        new_sl = trail['best'] + trail_dist
                         new_sl = round(round(new_sl / tk_sz) * tk_sz, 0)
 
                     # Update SL on ALL same-side GEX positions (initial + DCA)
@@ -1331,6 +1366,9 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                     continue  # don't DCA once trailing is active (position winning)
                 if trail['dca_count'] >= GEX_DCA_MAX_ORDERS:
                     continue  # max DCA reached
+                # Cooldown: skip DCA for 60s after a failed order attempt
+                if '_dca_cooldown' in trail and (_dt.now() - trail['_dca_cooldown']).total_seconds() < 60:
+                    continue
 
                 tk_sz = trail['tick_sz']
                 tk_val = trail['tick_val']
@@ -1352,97 +1390,133 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                 levels_crossed = int(loss_r / dca_step_r) if dca_step_r > 0 else 0
                 needed = levels_crossed - trail['dca_count']
 
-                if needed > 0:
-                    for _ in range(needed):
-                        if trail['dca_count'] >= GEX_DCA_MAX_ORDERS:
+                while needed > 0:
+                    if trail['dca_count'] >= GEX_DCA_MAX_ORDERS:
+                        break
+                    fib_idx = trail['dca_count'] if trail['dca_count'] < len(_fib) else len(_fib) - 1
+                    dca_vol = trail['vol'] * _fib[fib_idx]
+
+                    # --- Cap DCA: skip if adding would exceed margin budget ---
+                    margin_1_dca = _mt5.order_calc_margin(
+                        _mt5.ORDER_TYPE_BUY if is_buy else _mt5.ORDER_TYPE_SELL,
+                        win_symbol, float(dca_vol),
+                        tick.ask if is_buy else tick.bid)
+                    current_margin_used = sum(p.volume for p in same_side) * (margin_1_dca / dca_vol if dca_vol > 0 and margin_1_dca else 0)
+                    if margin_1_dca is not None and margin_budget > 0:
+                        if current_margin_used + margin_1_dca > margin_budget:
+                            ts_now = _dt.now().strftime("%H:%M:%S")
+                            print(f"[{ts_now}] [DCA] SKIPPED — margin would exceed budget "
+                                  f"(used R${current_margin_used:,.2f} + R${margin_1_dca:,.2f} > budget R${margin_budget:,.2f})")
                             break
-                        fib_idx = trail['dca_count'] if trail['dca_count'] < len(_fib) else len(_fib) - 1
-                        dca_vol = trail['vol'] * _fib[fib_idx]
 
-                        # --- Cap DCA: skip if adding would exceed margin budget ---
-                        margin_1_dca = _mt5.order_calc_margin(
-                            _mt5.ORDER_TYPE_BUY if is_buy else _mt5.ORDER_TYPE_SELL,
-                            win_symbol, float(dca_vol),
-                            tick.ask if is_buy else tick.bid)
-                        current_margin_used = sum(p.volume for p in same_side) * (margin_1_dca / dca_vol if dca_vol > 0 and margin_1_dca else 0)
-                        if margin_1_dca is not None and margin_budget > 0:
-                            if current_margin_used + margin_1_dca > margin_budget:
-                                ts_now = _dt.now().strftime("%H:%M:%S")
-                                print(f"[{ts_now}] [DCA] SKIPPED — margin would exceed budget "
-                                      f"(used R${current_margin_used:,.2f} + R${margin_1_dca:,.2f} > budget R${margin_budget:,.2f})")
-                                break
+                    if is_buy:
+                        dca_price = tick.ask
+                        dca_type = _mt5.ORDER_TYPE_BUY
+                    else:
+                        dca_price = tick.bid
+                        dca_type = _mt5.ORDER_TYPE_SELL
 
-                        if is_buy:
-                            dca_price = tick.ask
-                            dca_type = _mt5.ORDER_TYPE_BUY
-                        else:
-                            dca_price = tick.bid
-                            dca_type = _mt5.ORDER_TYPE_SELL
+                    # --- Recalculate SL to bound aggregate risk within budget ---
+                    new_total_vol_proj = total_vol + dca_vol
+                    new_avg_entry = (trail['entry'] * total_vol + dca_price * dca_vol) / new_total_vol_proj
+                    pnl_per_pt_new = new_total_vol_proj * (tk_val / tk_sz)
+                    risk_r = margin_budget * GEX_SL_RISK_PCT
+                    new_sl_dist = (risk_r / pnl_per_pt_new) if pnl_per_pt_new > 0 else 0.0
+                    new_sl_dist = round(new_sl_dist / tk_sz) * tk_sz
+                    new_sl_dist = max(new_sl_dist, GEX_MIN_SL_POINTS)  # enforce minimum SL floor
 
-                        # --- Recalculate SL to bound aggregate risk within budget ---
-                        new_total_vol_proj = total_vol + dca_vol
-                        new_avg_entry = (trail['entry'] * total_vol + dca_price * dca_vol) / new_total_vol_proj
-                        pnl_per_pt_new = new_total_vol_proj * (tk_val / tk_sz)
-                        risk_r = margin_budget * GEX_SL_RISK_PCT
-                        new_sl_dist = (risk_r / pnl_per_pt_new) if pnl_per_pt_new > 0 else 0.0
-                        new_sl_dist = round(new_sl_dist / tk_sz) * tk_sz
-                        if is_buy:
-                            new_sl = round(round((new_avg_entry - new_sl_dist) / tk_sz) * tk_sz, 0)
-                        else:
-                            new_sl = round(round((new_avg_entry + new_sl_dist) / tk_sz) * tk_sz, 0)
-
-                        dca_n = trail['dca_count'] + 1
+                    # Risk guard: skip DCA if min SL floor causes actual risk > 2× budget
+                    actual_risk = new_sl_dist * pnl_per_pt_new
+                    if actual_risk > risk_r * 2:
                         ts_now = _dt.now().strftime("%H:%M:%S")
-                        print(f"\n[{ts_now}] [DCA] {'BUY' if is_buy else 'SELL'} #{dca_n}/{GEX_DCA_MAX_ORDERS} "
-                              f"@ {dca_price:.0f} | loss R${loss_r:,.2f} | +{dca_vol} contracts "
-                              f"| new SL {new_sl:.0f} (risk capped R${risk_r:,.2f})")
-                        wall_label = trail.get('wall', 'Wall')
-                        dca_result = mt5_conn.place_order(
-                            symbol=win_symbol,
-                            order_type=dca_type,
-                            volume=float(dca_vol),
-                            price=dca_price,
-                            deviation=GEX_ORDER_DEVIATION,
-                            comment=f"GEX DCA#{dca_n} {wall_label}",
-                            magic=GEX_MAGIC_NUMBER,
-                            sl=new_sl,
-                        )
-                        if dca_result is not None and hasattr(dca_result, 'retcode') and dca_result.retcode == _mt5.TRADE_RETCODE_DONE:
-                            trail['dca_count'] += 1
-                            # Update avg entry and SL for trailing
-                            new_total_vol = total_vol + dca_vol
-                            trail['entry'] = (trail['entry'] * total_vol + dca_price * dca_vol) / new_total_vol
-                            trail['sl_points'] = new_sl_dist
-                            trail['sl_price'] = new_sl
-                            total_vol = new_total_vol
-                            print(f"[{ts_now}] [DCA] FILLED — avg entry → {trail['entry']:.0f}, "
-                                  f"total {new_total_vol:.0f} contracts, SL → {new_sl:.0f}")
+                        print(f"[{ts_now}] [DCA] SKIPPED — min SL floor would expose "
+                              f"R${actual_risk:,.2f} risk (> 2× budget R${risk_r:,.2f})")
+                        break
 
-                            # --- Update SL on ALL existing same-side positions ---
-                            for sp in same_side:
-                                current_sp_sl = sp.sl
-                                should_update = False
-                                if is_buy and (current_sp_sl == 0.0 or new_sl != current_sp_sl):
-                                    should_update = True
-                                elif not is_buy and (current_sp_sl == 0.0 or new_sl != current_sp_sl):
-                                    should_update = True
-                                if should_update:
-                                    modify_req = {
-                                        "action": _mt5.TRADE_ACTION_SLTP,
-                                        "symbol": win_symbol,
-                                        "position": sp.ticket,
-                                        "sl": new_sl,
-                                        "tp": sp.tp,
-                                    }
-                                    mod_result = _mt5.order_send(modify_req)
-                                    if mod_result and mod_result.retcode == _mt5.TRADE_RETCODE_DONE:
-                                        print(f"[{ts_now}] [DCA] SL synced #{sp.ticket} → {new_sl:.0f}")
-                                    else:
-                                        err = mod_result.comment if mod_result else _mt5.last_error()
-                                        print(f"[{ts_now}] [DCA] SL sync #{sp.ticket} failed: {err}")
+                    if is_buy:
+                        new_sl = round(round((new_avg_entry - new_sl_dist) / tk_sz) * tk_sz, 0)
+                    else:
+                        new_sl = round(round((new_avg_entry + new_sl_dist) / tk_sz) * tk_sz, 0)
+
+                    dca_n = trail['dca_count'] + 1
+                    ts_now = _dt.now().strftime("%H:%M:%S")
+                    # TP: keep same target as initial order (opposite wall)
+                    dca_tp = same_side[0].tp if same_side else 0.0
+                    print(f"\n[{ts_now}] [DCA] {'BUY' if is_buy else 'SELL'} #{dca_n}/{GEX_DCA_MAX_ORDERS} "
+                          f"@ {dca_price:.0f} | loss R${loss_r:,.2f} | +{dca_vol} contracts "
+                          f"| new SL {new_sl:.0f} (risk capped R${risk_r:,.2f})")
+                    wall_label = trail.get('wall', 'Wall')
+                    dca_result = mt5_conn.place_order(
+                        symbol=win_symbol,
+                        order_type=dca_type,
+                        volume=float(dca_vol),
+                        price=dca_price,
+                        deviation=GEX_ORDER_DEVIATION,
+                        comment=f"GEX DCA#{dca_n} {wall_label}",
+                        magic=GEX_MAGIC_NUMBER,
+                        sl=new_sl,
+                        tp=dca_tp,
+                    )
+                    if dca_result is not None and hasattr(dca_result, 'retcode') and dca_result.retcode == _mt5.TRADE_RETCODE_DONE:
+                        trail['dca_count'] += 1
+                        # Update avg entry and SL for trailing
+                        new_total_vol = total_vol + dca_vol
+                        trail['entry'] = (trail['entry'] * total_vol + dca_price * dca_vol) / new_total_vol
+                        trail['sl_points'] = new_sl_dist
+                        trail['sl_price'] = new_sl
+                        total_vol = new_total_vol
+                        print(f"[{ts_now}] [DCA] FILLED — avg entry → {trail['entry']:.0f}, "
+                              f"total {new_total_vol:.0f} contracts, SL → {new_sl:.0f}")
+
+                        # --- Update SL on ALL existing same-side positions ---
+                        for sp in same_side:
+                            current_sp_sl = sp.sl
+                            should_update = False
+                            if is_buy and (current_sp_sl == 0.0 or new_sl != current_sp_sl):
+                                should_update = True
+                            elif not is_buy and (current_sp_sl == 0.0 or new_sl != current_sp_sl):
+                                should_update = True
+                            if should_update:
+                                modify_req = {
+                                    "action": _mt5.TRADE_ACTION_SLTP,
+                                    "symbol": win_symbol,
+                                    "position": sp.ticket,
+                                    "sl": new_sl,
+                                    "tp": sp.tp,
+                                }
+                                mod_result = _mt5.order_send(modify_req)
+                                if mod_result and mod_result.retcode == _mt5.TRADE_RETCODE_DONE:
+                                    print(f"[{ts_now}] [DCA] SL synced #{sp.ticket} → {new_sl:.0f}")
+                                else:
+                                    err = mod_result.comment if mod_result else _mt5.last_error()
+                                    print(f"[{ts_now}] [DCA] SL sync #{sp.ticket} failed: {err}")
+
+                        # Recalculate loss & needed after avg entry changed
+                        pnl_per_pt = total_vol * (tk_val / tk_sz)
+                        if is_buy:
+                            loss_pts = trail['entry'] - tick.bid
                         else:
-                            trail['dca_count'] += 1  # count attempt to avoid rapid retries
-                            print(f"[{ts_now}] [DCA] Order sent (check logs above)")
+                            loss_pts = tick.ask - trail['entry']
+                        loss_r = loss_pts * pnl_per_pt
+                        levels_crossed = int(loss_r / dca_step_r) if dca_step_r > 0 else 0
+                        needed = levels_crossed - trail['dca_count']
+                    else:
+                        trail['_dca_cooldown'] = _dt.now()  # cooldown: skip DCA for 60s after failure
+                        print(f"[{ts_now}] [DCA] Order FAILED — cooldown 60s (check logs above)")
+                        break  # don't retry more DCAs this tick
+
+            # --- Track daily realized P&L from closed GEX positions ---
+            # Check deal history since start-of-day for GEX magic exits
+            _today_start = _dt.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            _deals = _mt5.history_deals_get(_today_start, _dt.now(), group=f"*{win_symbol}*")
+            _daily_realized_pnl = sum(
+                d.profit for d in (_deals or [])
+                if d.magic == GEX_MAGIC_NUMBER and d.entry == _mt5.DEAL_ENTRY_OUT
+            )
+            if _daily_realized_pnl <= -_daily_loss_limit:
+                ts_now = _dt.now().strftime("%H:%M:%S")
+                print(f"[{ts_now}] [RISK] Daily loss R${_daily_realized_pnl:,.2f} "
+                      f">= limit R${-_daily_loss_limit:,.2f} — new entries halted")
 
             await asyncio.sleep(GEX_MONITOR_INTERVAL)
 
