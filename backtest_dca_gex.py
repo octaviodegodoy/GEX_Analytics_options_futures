@@ -29,9 +29,11 @@ from constants import (
     GEX_MIN_SL_POINTS, GEX_TRAILING_DISTANCE_FACTOR,
     GEX_MAX_DAILY_LOSS_PCT, GEX_TP_AT_OPPOSITE_WALL,
     GEX_TRADE_WINDOW_START, GEX_TRADE_WINDOW_END,
+    ASSET_SYMBOL,
 )
 from gex_utils import compute_weekly_walls, find_gamma_flip, generate_gex_trade_signals
 from main import _select_significant_zones
+from bs_greeks import bs_price
 
 # ── WIN contract specs ───────────────────────────────────────────────
 TICK_SIZE  = 5
@@ -49,6 +51,321 @@ MARGIN_BUDGET = FREE_MARGIN * GEX_MARGIN_FREE_PCT
 
 def align_tick(price):
     return round(round(price / TICK_SIZE) * TICK_SIZE)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  0DTE OPTION STRATEGY RECOMMENDER
+# ═══════════════════════════════════════════════════════════════════════
+
+def _load_0dte_chain(asset, spot, date_str):
+    """
+    Load the B3 options chain for *asset* on *date_str* and return
+    options expiring within 0-1 business days (0DTE on Fridays,
+    1DTE on Thursdays — both valid for short-dated strategies).
+
+    Unlike ``load_b3_options_data`` which computes DTE from today,
+    this computes DTE relative to the backtest date itself so that
+    historical near-expiry options are correctly identified.
+    """
+    from get_b3_data import fetch_b3_historical_file
+    from bs_greeks import bs_gamma as _bs_gamma, bs_delta as _bs_delta, implied_vol as _iv
+    from di1_rate_curve import get_rate_for_date, FALLBACK_RATE
+
+    raw = fetch_b3_historical_file(date_str)
+    if raw.empty:
+        return pd.DataFrame()
+
+    prefix = asset[:4].upper()
+    call_letters = set('ABCDEFGHIJKL')
+    put_letters  = set('MNOPQRSTUVWX')
+
+    opts = raw[raw['ticker'].str.startswith(prefix, na=False)].copy()
+    if opts.empty:
+        return pd.DataFrame()
+
+    def classify(ticker):
+        if len(ticker) > 4:
+            l = ticker[4].upper()
+            if l in call_letters: return 'CALL'
+            if l in put_letters:  return 'PUT'
+        return None
+
+    opts['Tipo'] = opts['ticker'].apply(classify)
+    opts = opts.dropna(subset=['Tipo'])
+
+    ref_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+
+    def parse_exp(exp_str):
+        try:
+            exp = datetime.strptime(str(exp_str).strip(), '%Y%m%d')
+            dte = max(int(np.busday_count(ref_date, exp.date())), 0)
+            return dte, exp
+        except (ValueError, TypeError):
+            return 999, None
+
+    parsed = opts['expiration'].apply(parse_exp)
+    opts['DTE'] = parsed.apply(lambda x: x[0])
+    opts['Expiration'] = parsed.apply(lambda x: x[1])
+
+    # Keep 0DTE (Friday = expiry day) or 1DTE (Thursday = day before expiry)
+    near_exp = opts[opts['DTE'] <= 1].copy()
+    if near_exp.empty:
+        return pd.DataFrame()
+
+    r = FALLBACK_RATE
+    rows = []
+    for _, row in near_exp.iterrows():
+        dte = int(row['DTE'])
+        T = max(dte, 0.5) / 252.0   # 0DTE → half-day; 1DTE → 1 full day
+        opt_type = row['Tipo'].lower()
+        strike = float(row['strike'])
+        close  = float(row['close'])
+        if close > 0 and strike > 0:
+            iv = _iv(close, spot, strike, T, r, opt_type)
+        else:
+            iv = 0.30
+        rows.append({
+            'Ticker': row['ticker'],
+            'Tipo':   row['Tipo'],
+            'Strike': strike,
+            'Ultimo': close,
+            'IV':     iv,
+            'Delta':  _bs_delta(spot, strike, T, r, iv, opt_type),
+            'Gamma':  _bs_gamma(spot, strike, T, r, iv),
+            'Tit.':   float(row['quantity']),
+            'VolFin': float(row['volume']),
+            'DTE':    dte,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def recommend_0dte_strategy(chain_0dte, spot, call_wall, put_wall, gamma_flip, r=0.10):
+    """
+    Analyse 0DTE options for one asset and recommend the lowest-risk
+    defined-risk strategy based on the current GEX regime.
+
+    Parameters
+    ----------
+    chain_0dte : DataFrame   Rows with DTE==0 (Tipo, Strike, Ultimo, IV, Gamma, Delta, Tit.)
+    spot       : float       Current underlying price
+    call_wall  : float       GEX call wall (resistance)
+    put_wall   : float       GEX put wall (support)
+    gamma_flip : float       GEX gamma-flip level
+    r          : float       Risk-free rate (annual)
+
+    Returns
+    -------
+    dict with keys:
+        strategy, strikes, max_risk, max_reward, breakevens,
+        regime, reason, iv_avg, n_strikes
+    or None if insufficient data.
+    """
+    if chain_0dte.empty or spot <= 0:
+        return None
+
+    calls = chain_0dte[chain_0dte['Tipo'] == 'CALL'].sort_values('Strike')
+    puts  = chain_0dte[chain_0dte['Tipo'] == 'PUT'].sort_values('Strike')
+
+    if calls.empty or puts.empty:
+        return None
+
+    # Use very small T for 0DTE (half trading day ~ 3.5 hours)
+    T = 0.5 / 252.0
+
+    # Available strikes with meaningful OI/volume
+    min_oi = chain_0dte['Tit.'].quantile(0.25) if len(chain_0dte) > 4 else 0
+    liquid = chain_0dte[chain_0dte['Tit.'] >= max(min_oi, 1)]
+    if liquid.empty:
+        liquid = chain_0dte
+
+    strikes = sorted(liquid['Strike'].unique())
+    n_strikes = len(strikes)
+    if n_strikes < 4:
+        return None
+
+    iv_avg = float(liquid['IV'].mean())
+
+    # Determine GEX regime
+    if np.isfinite(gamma_flip) and spot > 0:
+        ratio = spot / gamma_flip
+        if ratio > 1.02:
+            regime = 'POSITIVE_GAMMA'
+        elif ratio < 0.98:
+            regime = 'NEGATIVE_GAMMA'
+        else:
+            regime = 'TRANSITION'
+    else:
+        regime = 'UNKNOWN'
+
+    # Find ATM strike (closest to spot)
+    atm_strike = min(strikes, key=lambda k: abs(k - spot))
+
+    # Find strikes for spreads — pick the most liquid around key levels
+    otm_calls = [k for k in strikes if k > spot]
+    otm_puts  = [k for k in strikes if k < spot]
+
+    if len(otm_calls) < 2 or len(otm_puts) < 2:
+        return None
+
+    # Helper to price a strike using mid-market or B-S
+    def get_price(strike, opt_type):
+        rows = liquid[(liquid['Strike'] == strike) & (liquid['Tipo'] == opt_type)]
+        if not rows.empty and rows.iloc[0]['Ultimo'] > 0:
+            return float(rows.iloc[0]['Ultimo'])
+        iv_use = float(rows.iloc[0]['IV']) if not rows.empty and rows.iloc[0]['IV'] > 0 else iv_avg
+        return bs_price(spot, strike, T, r, iv_use, opt_type.lower())
+
+    # ── Strategy selection based on regime ──────────────────────────
+
+    # Helper: pick the strike N steps OTM from spot
+    def nth_otm_call(n):
+        return otm_calls[min(n, len(otm_calls) - 1)]
+    def nth_otm_put(n):
+        return otm_puts[max(len(otm_puts) - 1 - n, 0)]
+
+    if regime == 'POSITIVE_GAMMA':
+        # Range-bound: price pinned between walls → Iron Condor
+        # Short legs ~2 strikes OTM, wings 1 strike further out
+        short_put  = nth_otm_put(1)   # 2nd closest OTM put
+        long_put   = nth_otm_put(2)   # 3rd closest
+        short_call = nth_otm_call(1)  # 2nd closest OTM call
+        long_call  = nth_otm_call(2)  # 3rd closest
+
+        # Try to place short legs near GEX walls for higher probability
+        if np.isfinite(put_wall):
+            pw_strikes = [k for k in otm_puts if k <= put_wall * 1.01]
+            if len(pw_strikes) >= 2:
+                short_put = pw_strikes[-1]
+                long_put  = pw_strikes[-2]
+        if np.isfinite(call_wall):
+            cw_strikes = [k for k in otm_calls if k >= call_wall * 0.99]
+            if len(cw_strikes) >= 2:
+                short_call = cw_strikes[0]
+                long_call  = cw_strikes[1]
+
+        # Ensure all 4 strikes are distinct
+        if long_put >= short_put:
+            long_put = otm_puts[0]
+        if long_call <= short_call:
+            long_call = otm_calls[-1]
+
+        p_sp = get_price(short_put, 'PUT')
+        p_lp = get_price(long_put, 'PUT')
+        p_sc = get_price(short_call, 'CALL')
+        p_lc = get_price(long_call, 'CALL')
+
+        credit   = (p_sp - p_lp) + (p_sc - p_lc)
+        put_width  = abs(short_put - long_put)
+        call_width = abs(long_call - short_call)
+        max_width  = max(put_width, call_width)
+        max_risk   = max_width - credit
+        max_reward = credit
+        be_low  = short_put - credit
+        be_high = short_call + credit
+
+        return {
+            'strategy': 'Iron Condor',
+            'legs': f"Sell {short_put:.2f}P / Buy {long_put:.2f}P + Sell {short_call:.2f}C / Buy {long_call:.2f}C",
+            'strikes': (long_put, short_put, short_call, long_call),
+            'max_risk': max(max_risk, 0.01),
+            'max_reward': max(max_reward, 0),
+            'breakevens': (be_low, be_high),
+            'regime': regime,
+            'reason': 'Positive gamma = range-bound; sell premium between GEX walls',
+            'iv_avg': iv_avg,
+            'n_strikes': n_strikes,
+        }
+
+    elif regime == 'NEGATIVE_GAMMA':
+        # Trending / volatile: use a Debit Spread in the trend direction
+        # Near put wall = expect bounce → Bull Call Spread
+        # Near call wall = expect rejection → Bear Put Spread
+        dist_to_pw = abs(spot - put_wall) if np.isfinite(put_wall) else 999
+        dist_to_cw = abs(spot - call_wall) if np.isfinite(call_wall) else 999
+
+        if dist_to_pw <= dist_to_cw:
+            # Closer to put wall → bullish bounce → Bull Call Spread
+            buy_k  = nth_otm_call(0)   # 1st OTM call (slightly OTM)
+            sell_k = nth_otm_call(2)   # 3rd OTM call (wider wing)
+            if buy_k == sell_k:
+                sell_k = nth_otm_call(1)
+            p_buy  = get_price(buy_k, 'CALL')
+            p_sell = get_price(sell_k, 'CALL')
+            debit  = p_buy - p_sell
+            width  = sell_k - buy_k
+            max_risk   = max(debit, 0.01)
+            max_reward = width - debit
+            be = buy_k + debit
+            strat_name = 'Bull Call Spread'
+            legs_str   = f"Buy {buy_k:.2f}C / Sell {sell_k:.2f}C"
+            strikes_t  = (buy_k, sell_k)
+            reason     = 'Negative gamma near put wall: expect bounce, limited-risk bullish'
+            bes        = (be,)
+        else:
+            # Closer to call wall → bearish rejection → Bear Put Spread
+            buy_k  = nth_otm_put(0)   # 1st OTM put (slightly OTM)
+            sell_k = nth_otm_put(2)   # 3rd OTM put (wider wing)
+            if buy_k == sell_k:
+                sell_k = nth_otm_put(1)
+            p_buy  = get_price(buy_k, 'PUT')
+            p_sell = get_price(sell_k, 'PUT')
+            debit  = p_buy - p_sell
+            width  = buy_k - sell_k
+            max_risk   = max(debit, 0.01)
+            max_reward = width - debit
+            be = buy_k - debit
+            strat_name = 'Bear Put Spread'
+            legs_str   = f"Buy {buy_k:.2f}P / Sell {sell_k:.2f}P"
+            strikes_t  = (sell_k, buy_k)
+            reason     = 'Negative gamma near call wall: expect rejection, limited-risk bearish'
+            bes        = (be,)
+
+        return {
+            'strategy': strat_name,
+            'legs': legs_str,
+            'strikes': strikes_t,
+            'max_risk': max_risk,
+            'max_reward': max(max_reward, 0),
+            'breakevens': bes,
+            'regime': regime,
+            'reason': reason,
+            'iv_avg': iv_avg,
+            'n_strikes': n_strikes,
+        }
+
+    else:
+        # TRANSITION / UNKNOWN → Iron Butterfly (cheapest defined-risk, profits from pin)
+        # Sell ATM straddle + buy nearby OTM wings (~2-3 strikes out)
+        wing_put  = nth_otm_put(2)    # 3rd OTM put
+        wing_call = nth_otm_call(2)   # 3rd OTM call
+
+        p_sc = get_price(atm_strike, 'CALL')
+        p_sp = get_price(atm_strike, 'PUT')
+        p_wc = get_price(wing_call, 'CALL')
+        p_wp = get_price(wing_put, 'PUT')
+
+        credit   = (p_sc + p_sp) - (p_wc + p_wp)
+        put_wing_w  = atm_strike - wing_put
+        call_wing_w = wing_call - atm_strike
+        max_width   = max(put_wing_w, call_wing_w)
+        max_risk    = max_width - credit
+        max_reward  = credit
+        be_low  = atm_strike - credit
+        be_high = atm_strike + credit
+
+        return {
+            'strategy': 'Iron Butterfly',
+            'legs': f"Sell {atm_strike:.2f}C+P / Buy {wing_put:.2f}P + {wing_call:.2f}C",
+            'strikes': (wing_put, atm_strike, wing_call),
+            'max_risk': max(max_risk, 0.01),
+            'max_reward': max(max_reward, 0),
+            'breakevens': (be_low, be_high),
+            'regime': regime,
+            'reason': 'Transition/unknown regime: sell ATM premium with defined wings',
+            'iv_avg': iv_avg,
+            'n_strikes': n_strikes,
+        }
 
 
 def _compute_gex_walls_for_day(date_str, spot):
@@ -471,6 +788,7 @@ def main():
     print(f"{'='*80}\n")
 
     all_trades = []
+    all_0dte_recs = []   # [{day, asset, spot, rec_dict}, ...]
 
     for day_dt in last_week:
         day_str = day_dt.strftime("%Y-%m-%d")
@@ -567,6 +885,55 @@ def main():
                   f"| trail={'Y' if t['trailing'] else 'N'}")
             all_trades.append(t)
 
+        # ── 0DTE strategy recommendation per asset ────────────
+        for asset in ASSET_SYMBOL:
+            try:
+                if asset == "BOVA11":
+                    a_spot = spot_bova
+                    a_cw, a_pw, a_gf = call_wall, put_wall, gamma_flip
+                else:
+                    a_daily = mt5_conn.get_data(asset, mt5.TIMEFRAME_D1, 10, 0)
+                    if a_daily is None or a_daily.empty:
+                        continue
+                    a_daily['date'] = a_daily['time'].dt.date
+                    a_day_bar = a_daily[a_daily['date'] <= day_dt.date()]
+                    if a_day_bar.empty:
+                        continue
+                    a_spot = float(a_day_bar.iloc[-1]['open'])
+                    if a_spot <= 0:
+                        continue
+                    # Compute lightweight GEX walls from the full chain
+                    from b3_options_loader import load_b3_options_data as _load_full
+                    a_df = _load_full(asset, a_spot, date=b3_date)
+                    if a_df.empty:
+                        a_cw, a_pw, a_gf = np.nan, np.nan, np.nan
+                    else:
+                        sign_a = np.where(a_df['Tipo'].str.upper().str.contains('PUT'), -1.0, 1.0)
+                        a_df['GEX_customer'] = a_df['Gamma'] * (a_spot ** 2) * a_df['Tit.'] * sign_a
+                        comb = a_df.groupby('Strike', as_index=False)['GEX_customer'].sum()
+                        abv = comb[comb['Strike'] >= a_spot]
+                        blw = comb[comb['Strike'] <= a_spot]
+                        a_cw = float(abv.loc[abv['GEX_customer'].idxmax(), 'Strike']) if not abv.empty else np.nan
+                        a_pw = float(blw.loc[blw['GEX_customer'].abs().idxmax(), 'Strike']) if not blw.empty else np.nan
+                        a_gf = find_gamma_flip(a_df, a_spot)
+
+                chain_0 = _load_0dte_chain(asset, a_spot, b3_date)
+                if chain_0.empty:
+                    continue
+                rec = recommend_0dte_strategy(chain_0, a_spot, a_cw, a_pw, a_gf)
+                if rec:
+                    # Determine entry type: 0DTE (expiry day) vs 1DTE (day before)
+                    min_dte = int(chain_0['DTE'].min())
+                    dte_label = '0DTE' if min_dte == 0 else '1DTE'
+                    weekday = day_dt.strftime('%a')
+                    all_0dte_recs.append({
+                        'day': day_str, 'asset': asset,
+                        'spot': a_spot, 'dte_label': dte_label,
+                        'weekday': weekday, **rec
+                    })
+            except Exception as e:
+                pass  # skip silently — 0DTE is informational only
+
     # ══════════════════════════════════════════════════════════════════
     # SUMMARY REPORT
     # ══════════════════════════════════════════════════════════════════
@@ -642,7 +1009,70 @@ def main():
         print(f"    {day}  R$ {pnl:>+9,.2f}  cum: R$ {cum:>+9,.2f}  {color}{bar}")
     print(f"  {'─'*70}")
     print(f"    CUMULATIVE: R$ {cum:>+9,.2f}  ({cum / MARGIN_BUDGET * 100:+.1f}% ROI)")
-    print()
+
+    # ══════════════════════════════════════════════════════════════════
+    # 0DTE OPTION STRATEGY RECOMMENDATIONS
+    # ══════════════════════════════════════════════════════════════════
+    if all_0dte_recs:
+        print(f"\n\n{'='*110}")
+        print(f"  SHORT-DATED OPTION STRATEGIES — LOWEST-RISK RECOMMENDATIONS PER ASSET")
+        print(f"  (0DTE = expiry day / Friday | 1DTE = day before expiry / Thursday)")
+        print(f"{'='*110}")
+
+        # Group by asset for a summary table
+        for asset in ASSET_SYMBOL:
+            asset_recs = [r for r in all_0dte_recs if r['asset'] == asset]
+            if not asset_recs:
+                continue
+
+            print(f"\n  {'─'*106}")
+            print(f"  {asset:^106}")
+            print(f"  {'─'*106}")
+            print(f"  {'Day':<12} {'':>3} {'DTE':<5} {'Spot':>8} {'Regime':<16} {'Strategy':<18} "
+                  f"{'Legs':<38} {'MaxRisk':>8} {'MaxRwd':>8}")
+            print(f"  {'─'*106}")
+
+            for r in asset_recs:
+                print(f"  {r['day']:<12} {r.get('weekday',''):>3} {r.get('dte_label','?'):<5} {r['spot']:>8.2f} {r['regime']:<16} "
+                      f"{r['strategy']:<18} {r['legs']:<38} "
+                      f"R${r['max_risk']:>6.2f} R${r['max_reward']:>6.2f}")
+
+            # Print detail for last day (most recent / actionable)
+            last = asset_recs[-1]
+            print(f"\n    Latest ({last['day']} {last.get('weekday','')}, {last.get('dte_label','')}):")
+            print(f"      Strategy   : {last['strategy']}")
+            print(f"      Regime     : {last['regime']}")
+            print(f"      Reason     : {last['reason']}")
+            print(f"      Legs       : {last['legs']}")
+            print(f"      Max Risk   : R$ {last['max_risk']:.2f} per contract")
+            print(f"      Max Reward : R$ {last['max_reward']:.2f} per contract")
+            bes_str = ' / '.join(f"{b:.2f}" for b in last['breakevens'])
+            print(f"      Breakevens : {bes_str}")
+            print(f"      Avg IV     : {last['iv_avg']*100:.1f}%")
+            print(f"      Liquid Strikes : {last['n_strikes']}")
+            rr = last['max_reward'] / last['max_risk'] if last['max_risk'] > 0 else 0
+            print(f"      Risk/Reward: 1:{rr:.1f}")
+
+        # Aggregated regime overview
+        print(f"\n  {'─'*96}")
+        print(f"  {'REGIME SUMMARY':^96}")
+        print(f"  {'─'*96}")
+        for asset in ASSET_SYMBOL:
+            asset_recs = [r for r in all_0dte_recs if r['asset'] == asset]
+            if not asset_recs:
+                continue
+            regimes = [r['regime'] for r in asset_recs]
+            most_common = max(set(regimes), key=regimes.count)
+            strats = [r['strategy'] for r in asset_recs]
+            most_strat = max(set(strats), key=strats.count)
+            avg_iv = np.mean([r['iv_avg'] for r in asset_recs])
+            print(f"    {asset:<8} Dominant regime: {most_common:<18} "
+                  f"Best strategy: {most_strat:<20} Avg IV: {avg_iv*100:.1f}%")
+
+        print(f"  {'─'*96}")
+        print()
+    else:
+        print(f"\n  [i] No 0DTE options data available for the backtest period.\n")
 
 
 if __name__ == "__main__":

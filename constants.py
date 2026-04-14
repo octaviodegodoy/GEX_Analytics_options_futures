@@ -5,8 +5,8 @@ GEX_MAGIC_NUMBER = 345347          # Separate magic for GEX pending orders
 CALL_OPTION = 0
 UNIX_DAYS_IN_SECONDS = 60*60*24
 MIN_DAYS_TO_EXPIRY = 35*UNIX_DAYS_IN_SECONDS # 45 days in seconds
-ASSET_SYMBOL = ["BOVA11", "VALE3", "PETR4"] #, "GOAU4", "BBAS3", "BRAV3", "ITUB4", "BBDC4", "MGLU3", "RAIZ4"]
-PLOT_GEX = False  # Set to False to skip all GEX chart generation
+ASSET_SYMBOL = ["BOVA11", "VALE3","HASH11","PETR4","ITUB4","BBAS3"] #, "GOAU4", "BBAS3", "BRAV3", "ITUB4", "BBDC4", "MGLU3", "RAIZ4"]
+PLOT_GEX = True  # Set to False to skip all GEX chart generation
 
 # --- GEX Order & Monitor Settings ---
 GEX_SEND_ORDERS = True            # Set to True to enable order execution
