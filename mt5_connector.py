@@ -353,11 +353,19 @@ class MT5Connector:
     def get_symbol_futures(self,group_name):
         futures_symbols = mt5.symbols_get(group_name)
         time_now = int(time.time())
+        # Start of today (midnight) – symbols expiring today are treated as expired
+        today_start = int(datetime(
+            *datetime.fromtimestamp(time_now).timetuple()[:3]
+        ).timestamp())
         next_symbols_fut = {}
         past_symbols_fut = {}
         for s in futures_symbols:
-            if s.expiration_time > time_now:
-               next_symbols_fut[s.expiration_time] = s.name
+            if s.expiration_time > time_now and s.expiration_time >= today_start:
+               # Expires today → treat as expired, pick the next contract
+               if datetime.fromtimestamp(s.expiration_time).date() == datetime.fromtimestamp(time_now).date():
+                   past_symbols_fut[s.expiration_time] = s.name
+               else:
+                   next_symbols_fut[s.expiration_time] = s.name
             elif s.expiration_time < time_now:
                past_symbols_fut[s.expiration_time] = s.name
         
