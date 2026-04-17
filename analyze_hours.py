@@ -30,18 +30,20 @@ def run_sweep():
     build_di1_curve(mt5_conn)
 
     try:
-        _, win_symbol = mt5_conn.get_symbol_futures("*WIN*")
+        win_symbol, prev_win = mt5_conn.get_win_symbols()
+        print(f"[i] WIN contracts: current={win_symbol}, previous={prev_win}")
     except:
-        win_symbol = "WIN$N"
+        print("[!] Could not resolve WIN symbols"); return
+
+    if not win_symbol:
+        print("[!] No WIN contract resolved"); return
 
     mapper = None
-    for ind_sym in ["WIN$N", win_symbol]:
-        try:
-            mapper = build_ind_bova11_mapper_intraday(
-                mt5_conn, ind_symbol=ind_sym, bova11_symbol="BOVA11", max_days=10)
-            break
-        except:
-            pass
+    try:
+        mapper = build_ind_bova11_mapper_intraday(
+            mt5_conn, ind_symbol=win_symbol, bova11_symbol="BOVA11", max_days=10)
+    except:
+        pass
     if mapper is None:
         print("[!] Could not build mapper"); return
 
@@ -77,9 +79,10 @@ def run_sweep():
         if cw is None or not np.isfinite(cw): continue
 
         bars_per_day = 90; total_bars = bars_per_day * 10
-        win_intra = mt5_conn.get_data(win_symbol, mt5.TIMEFRAME_M5, total_bars, 0)
-        if win_intra is None or win_intra.empty:
-            win_intra = mt5_conn.get_data("WIN$N", mt5.TIMEFRAME_M5, total_bars, 0)
+        try:
+            win_intra, _ = mt5_conn.get_historical_futures_data("*WIN*", mt5.TIMEFRAME_M5, total_bars, 0)
+        except Exception:
+            win_intra = None
         if win_intra is None or win_intra.empty: continue
 
         win_intra['date'] = win_intra['time'].dt.date

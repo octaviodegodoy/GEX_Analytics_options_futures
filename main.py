@@ -1661,41 +1661,35 @@ async def main():
     # Build DI1 term-structure once (spline-interpolated per expiry)
     build_di1_curve(mt5_conn)
 
-    # Build Kalman mapper WIN$N <-> BOVA11 on 15-min bars (best for intraday)
+    # Build Kalman mapper WIN <-> BOVA11 on 15-min bars (best for intraday)
     win_mapper = None
     win_symbol = ""
     if "BOVA11" in ASSET_SYMBOL:
-        # Resolve the current WIN mini futures contract (e.g. WINM26)
+        # Resolve current + previous WIN mini futures contracts
         try:
-            _exp_time, win_symbol = mt5_conn.get_symbol_futures("*WIN*")
-            print(f"[i] Current WIN futures contract: {win_symbol}")
+            current_win, prev_win = mt5_conn.get_win_symbols()
+            win_symbol = current_win or ""
+            print(f"[i] WIN contracts: current={current_win}, previous={prev_win}")
         except Exception as e:
-            print(f"[!] Could not resolve current WIN symbol: {e}")
+            print(f"[!] Could not resolve WIN symbols: {e}")
             win_symbol = ""
 
-        # Try WIN$N first; if unavailable, fall back to the current WIN contract
-        ind_symbols_to_try = ["WIN$N"]
         if win_symbol:
-            ind_symbols_to_try.append(win_symbol)
-
-        for ind_sym in ind_symbols_to_try:
             try:
                 win_mapper = build_ind_bova11_mapper_intraday(
-                    mt5_conn, ind_symbol=ind_sym, bova11_symbol="BOVA11"
+                    mt5_conn, ind_symbol=win_symbol, bova11_symbol="BOVA11"
                 )
-                print(f"[i] Intraday mapper built using {ind_sym}")
-                break
+                print(f"[i] Intraday mapper built using {win_symbol}")
             except Exception as e:
-                print(f"[!] Intraday mapper failed for {ind_sym}: {e}")
-                # Fallback to daily mapper with the same symbol
+                print(f"[!] Intraday mapper failed for {win_symbol}: {e}")
+                # Fallback to daily mapper
                 try:
-                    win_mapper = build_ind_bova11_mapper(mt5_conn, ind_symbol=ind_sym, bova11_symbol="BOVA11")
-                    print(f"[i] Daily mapper built using {ind_sym}")
-                    break
+                    win_mapper = build_ind_bova11_mapper(mt5_conn, ind_symbol=win_symbol, bova11_symbol="BOVA11")
+                    print(f"[i] Daily mapper built using {win_symbol}")
                 except Exception as e2:
-                    print(f"[!] Daily mapper also failed for {ind_sym}: {e2}")
+                    print(f"[!] Daily mapper also failed for {win_symbol}: {e2}")
         else:
-            print("[!] All WIN symbol attempts exhausted -- no mapper available")
+            print("[!] No WIN contract resolved -- no mapper available")
 
     bova11_gex = None
     for asset in ASSET_SYMBOL:
