@@ -410,6 +410,93 @@ class MT5Connector:
             return current_symbol, expiring_name
 
         return current_symbol
+
+    def get_win_symbols(self):
+        """Return (current_symbol, previous_symbol) for WIN futures.
+
+        current_symbol  : the front-month contract (e.g. WINM26)
+        previous_symbol : the rolling/expiring contract when available,
+                          otherwise the most-recent expired contract.
+        """
+        import re
+        from constants import FUTURES_ROLL_BUFFER_HOURS
+
+        futures_symbols = mt5.symbols_get("*WIN*")
+        if not futures_symbols:
+            return None, None
+
+        time_now = int(time.time())
+        roll_cutoff = time_now + int(FUTURES_ROLL_BUFFER_HOURS * 3600)
+        next_symbols_fut = {}
+        rolling_symbols_fut = {}
+        past_symbols_fut = {}
+        contract_re = re.compile(r'^WIN[FGHJKMNQUVXZ]\d{2}$', re.IGNORECASE)
+
+        for s in futures_symbols:
+            if not contract_re.match(s.name):
+                continue
+            if s.expiration_time > roll_cutoff:
+                next_symbols_fut[s.expiration_time] = s.name
+            elif s.expiration_time > time_now:
+                rolling_symbols_fut[s.expiration_time] = s.name
+            else:
+                past_symbols_fut[s.expiration_time] = s.name
+
+        current_symbol = None
+        if next_symbols_fut:
+            sorted_next = sorted(next_symbols_fut.items())
+            current_symbol = sorted_next[0][1]
+
+        previous_symbol = None
+        if rolling_symbols_fut:
+            sorted_rolling = sorted(rolling_symbols_fut.items(), reverse=True)
+            previous_symbol = sorted_rolling[0][1]
+        elif past_symbols_fut:
+            sorted_past = sorted(past_symbols_fut.items())
+            previous_symbol = sorted_past[-1][1]
+
+        return current_symbol, previous_symbol
+
+    def get_historical_futures_data(self, group_pattern, timeframe, periods, shift=0):
+        """Fetch historical data combining current + previous WIN contract.
+
+        Returns a single DataFrame with bars from the previous contract
+        followed by the current contract (de-duplicated by time, preferring
+        the current contract for overlapping bars).
+        """
+        current_sym, prev_sym = self.get_win_symbols()
+        if current_sym is None:
+            raise RuntimeError(f"No active WIN contract found for {group_pattern}")
+
+        df_current = self.get_data(current_sym, timeframe, periods, shift)
+
+        if prev_sym:
+            df_prev = self.get_data(prev_sym, timeframe, periods, shift)
+        else:
+            df_prev = None
+
+        if df_current is None or df_current.empty:
+            if df_prev is not None and not df_prev.empty:
+                print(f"[i] Using only previous contract {prev_sym} ({len(df_prev)} bars)")
+                return df_prev, prev_sym
+            raise RuntimeError(f"No data for {current_sym}" +
+                               (f" or {prev_sym}" if prev_sym else ""))
+
+        if df_prev is not None and not df_prev.empty:
+            # Keep previous bars that are BEFORE the earliest current bar
+            earliest_current = df_current['time'].min()
+            older_bars = df_prev[df_prev['time'] < earliest_current]
+            if not older_bars.empty:
+                combined = pd.concat([older_bars, df_current], ignore_index=True)
+                combined = combined.sort_values('time').reset_index(drop=True)
+                print(f"[i] Combined {prev_sym} ({len(older_bars)} older bars) + "
+                      f"{current_sym} ({len(df_current)} bars) = {len(combined)} total")
+                return combined, current_sym
+            else:
+                print(f"[i] Previous contract {prev_sym} has no bars before {current_sym}")
+
+        print(f"[i] Using {current_sym} only ({len(df_current)} bars)")
+        return df_current, current_sym
     
     def get_options_chain(self,group_name,option_type):
         server_info = mt5.account_info().server

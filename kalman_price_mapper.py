@@ -165,7 +165,7 @@ class KalmanPriceMapper:
 # Builder — fetch from MT5 and fit
 # ============================================================
 def build_ind_bova11_mapper(mt5_conn,
-                            ind_symbol: str = "WIN$N",
+                            ind_symbol: str = "WINM26",
                             bova11_symbol: str = "BOVA11",
                             periods: int = PERIODS,
                             delta: float = 1e-4,
@@ -194,7 +194,11 @@ def build_ind_bova11_mapper(mt5_conn,
     KalmanPriceMapper
         Fitted mapper. Call .bova11_to_ind(price) or .ind_to_bova11(price).
     """
-    df_ind = mt5_conn.get_data(ind_symbol, mt5_conn.TIMEFRAME_D1, periods, SHIFT_PERIODS)
+    # Use combined current+previous contract data for WIN
+    try:
+        df_ind, _sym = mt5_conn.get_historical_futures_data("*WIN*", mt5_conn.TIMEFRAME_D1, periods, SHIFT_PERIODS)
+    except Exception:
+        df_ind = mt5_conn.get_data(ind_symbol, mt5_conn.TIMEFRAME_D1, periods, SHIFT_PERIODS)
     df_bova = mt5_conn.get_data(bova11_symbol, mt5_conn.TIMEFRAME_D1, periods, SHIFT_PERIODS)
 
     if df_ind is None or df_bova is None:
@@ -269,7 +273,7 @@ def _build_candidate_days(max_days: int) -> list:
 
 def build_ind_bova11_mapper_intraday(
     mt5_conn,
-    ind_symbol: str = "WIN$N",
+    ind_symbol: str = "WINM26",
     bova11_symbol: str = "BOVA11",
     max_days: int = PERIODS,
     delta: float = 1e-3,
@@ -313,8 +317,12 @@ def build_ind_bova11_mapper_intraday(
     for days in candidate_days:
         n_bars = days * BARS_PER_DAY_15M + 10  # small buffer
 
-        df_ind = mt5_conn.get_data(ind_symbol, mt5_conn.TIMEFRAME_M15,
-                                   n_bars, SHIFT_PERIODS)
+        # Use combined current+previous contract data for WIN
+        try:
+            df_ind, _sym = mt5_conn.get_historical_futures_data("*WIN*", mt5_conn.TIMEFRAME_M15, n_bars, SHIFT_PERIODS)
+        except Exception:
+            df_ind = mt5_conn.get_data(ind_symbol, mt5_conn.TIMEFRAME_M15,
+                                       n_bars, SHIFT_PERIODS)
         df_bova = mt5_conn.get_data(bova11_symbol, mt5_conn.TIMEFRAME_M15,
                                     n_bars, SHIFT_PERIODS)
 
@@ -379,8 +387,11 @@ def build_ind_bova11_mapper_intraday(
 
     # Re-fit best period on ALL data
     n_bars = best_days * BARS_PER_DAY_15M + 10
-    df_ind = mt5_conn.get_data(ind_symbol, mt5_conn.TIMEFRAME_M15,
-                               n_bars, SHIFT_PERIODS)
+    try:
+        df_ind, _sym = mt5_conn.get_historical_futures_data("*WIN*", mt5_conn.TIMEFRAME_M15, n_bars, SHIFT_PERIODS)
+    except Exception:
+        df_ind = mt5_conn.get_data(ind_symbol, mt5_conn.TIMEFRAME_M15,
+                                   n_bars, SHIFT_PERIODS)
     df_bova = mt5_conn.get_data(bova11_symbol, mt5_conn.TIMEFRAME_M15,
                                 n_bars, SHIFT_PERIODS)
 

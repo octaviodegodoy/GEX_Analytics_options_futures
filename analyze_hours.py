@@ -30,15 +30,18 @@ def run_sweep():
     build_di1_curve(mt5_conn)
 
     try:
-        (_, win_symbol), expiring_sym = mt5_conn.get_symbol_futures("*WIN*", include_expiring=True)
+        win_symbol, prev_win = mt5_conn.get_win_symbols()
+        print(f"[i] WIN contracts: current={win_symbol}, previous={prev_win}")
     except:
-        print("[!] Could not resolve WIN futures contract"); return
+        print("[!] Could not resolve WIN symbols"); return
+
+    if not win_symbol:
+        print("[!] No WIN contract resolved"); return
 
     mapper = None
-    # Try trading symbol first, then expiring contract as data fallback
     syms_to_try = [win_symbol]
-    if expiring_sym and expiring_sym != win_symbol:
-        syms_to_try.append(expiring_sym)
+    if prev_win and prev_win != win_symbol:
+        syms_to_try.append(prev_win)
     for sym in syms_to_try:
         try:
             mapper = build_ind_bova11_mapper_intraday(
@@ -82,9 +85,10 @@ def run_sweep():
         if cw is None or not np.isfinite(cw): continue
 
         bars_per_day = 90; total_bars = bars_per_day * 10
-        win_intra = mt5_conn.get_data(win_symbol, mt5.TIMEFRAME_M5, total_bars, 0)
-        if win_intra is None or win_intra.empty:
-            win_intra = mt5_conn.get_data("WIN$N", mt5.TIMEFRAME_M5, total_bars, 0)
+        try:
+            win_intra, _ = mt5_conn.get_historical_futures_data("*WIN*", mt5.TIMEFRAME_M5, total_bars, 0)
+        except Exception:
+            win_intra = None
         if win_intra is None or win_intra.empty: continue
 
         win_intra['date'] = win_intra['time'].dt.date

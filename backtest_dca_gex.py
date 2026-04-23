@@ -1556,10 +1556,10 @@ def main():
         # We fetch enough bars to cover last week then filter to the target day
         bars_per_day = 90  # ~7.5 hours × 12 bars/hour at 5-min
         total_bars = bars_per_day * 10  # extra buffer
-        win_intra = mt5_conn.get_data(win_symbol, mt5.TIMEFRAME_M5, total_bars, 0)
-        if win_intra is None or win_intra.empty:
-            # Try continuous contract
-            win_intra = mt5_conn.get_data("WIN$N", mt5.TIMEFRAME_M5, total_bars, 0)
+        try:
+            win_intra, _ = mt5_conn.get_historical_futures_data("*WIN*", mt5.TIMEFRAME_M5, total_bars, 0)
+        except Exception:
+            win_intra = None
 
         if win_intra is None or win_intra.empty:
             print(f"  [!] No intraday WIN data — skipping")
@@ -1609,6 +1609,9 @@ def main():
             all_trades.append(t)
 
         # ── 0DTE strategy recommendation per asset ────────────
+        print(f"\n  {'0DTE / 1DTE STRATEGY RECOMMENDATIONS':^60}")
+        print(f"  {'─'*60}")
+        day_has_0dte = False
         for asset in ASSET_SYMBOL:
             try:
                 if asset == "BOVA11":
@@ -1617,13 +1620,16 @@ def main():
                 else:
                     a_daily = mt5_conn.get_data(asset, mt5.TIMEFRAME_D1, 10, 0)
                     if a_daily is None or a_daily.empty:
+                        print(f"  [{asset}] No daily data — skipped")
                         continue
                     a_daily['date'] = a_daily['time'].dt.date
                     a_day_bar = a_daily[a_daily['date'] <= day_dt.date()]
                     if a_day_bar.empty:
+                        print(f"  [{asset}] No bar for {day_str} — skipped")
                         continue
                     a_spot = float(a_day_bar.iloc[-1]['open'])
                     if a_spot <= 0:
+                        print(f"  [{asset}] Invalid spot ({a_spot}) — skipped")
                         continue
                     # Compute lightweight GEX walls from the full chain
                     from b3_options_loader import load_b3_options_data as _load_full
@@ -1642,6 +1648,7 @@ def main():
 
                 chain_0 = _load_0dte_chain(asset, a_spot, b3_date)
                 if chain_0.empty:
+                    print(f"  [{asset}] No 0DTE chain found for {b3_date}")
                     continue
                 rec = recommend_0dte_strategy(chain_0, a_spot, a_cw, a_pw, a_gf)
                 if rec:
@@ -1654,8 +1661,20 @@ def main():
                         'spot': a_spot, 'dte_label': dte_label,
                         'weekday': weekday, **rec
                     })
+                    day_has_0dte = True
+                    rr = rec['max_reward'] / rec['max_risk'] if rec['max_risk'] > 0 else 0
+                    bes_str = ' / '.join(f"{b:.2f}" for b in rec['breakevens'])
+                    print(f"  [{asset}] {dte_label} | Spot={a_spot:.2f} | Regime: {rec['regime']}")
+                    print(f"    Strategy : {rec['strategy']}  |  Legs: {rec['legs']}")
+                    print(f"    Reason   : {rec['reason']}")
+                    print(f"    MaxRisk  : R$ {rec['max_risk']:.2f}  |  MaxReward: R$ {rec['max_reward']:.2f}  |  R:R 1:{rr:.1f}")
+                    print(f"    Breakeven: {bes_str}  |  Avg IV: {rec['iv_avg']*100:.1f}%  |  Strikes: {rec['n_strikes']}")
+                else:
+                    print(f"  [{asset}] 0DTE chain found but no viable strategy")
             except Exception as e:
-                pass  # skip silently — 0DTE is informational only
+                print(f"  [{asset}] 0DTE error: {e}")
+        if not day_has_0dte:
+            print(f"  No 0DTE/1DTE recommendations for {day_str}")
 
     # ══════════════════════════════════════════════════════════════════
     # SUMMARY REPORT
@@ -1796,6 +1815,164 @@ def main():
         print()
     else:
         print(f"\n  [i] No 0DTE options data available for the backtest period.\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  STANDALONE 0DTE STRATEGY RUNNER
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_0dte_only():
+    """Run ONLY the 0DTE strategy recommendations (no DCA backtest)."""
+    import MetaTrader5 as mt5
+    from mt5_connector import MT5Connector
+
+    mt5_conn = MT5Connector()
+
+    # ── Determine dates from cached B3 data ──────────────────────────
+    cache_dir = os.path.join(SCRIPT_DIR, ".b3_cache")
+    cached_dates = []
+    for f in sorted(os.listdir(cache_dir)):
+        if f.startswith("COTAHIST_D") and f.endswith(".ZIP"):
+            try:
+                ds = f.replace("COTAHIST_D", "").replace(".ZIP", "")
+                d = datetime.strptime(ds, "%d%m%Y")
+                cached_dates.append(d)
+            except ValueError:
+                continue
+
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    last_week = [d for d in cached_dates if d < today and d.weekday() < 5]
+    last_week = sorted(last_week)[-5:]
+
+    if not last_week:
+        print("[!] No cached B3 data. Run main.py first to cache data.")
+        return
+
+    print(f"\n{'='*110}")
+    print(f"  0DTE / 1DTE STRATEGY RECOMMENDATIONS ONLY")
+    print(f"  Dates: {last_week[0].strftime('%Y-%m-%d')} to {last_week[-1].strftime('%Y-%m-%d')}")
+    print(f"  Assets: {', '.join(ASSET_SYMBOL)}")
+    print(f"{'='*110}\n")
+
+    all_0dte_recs = []
+
+    for day_dt in last_week:
+        day_str = day_dt.strftime("%Y-%m-%d")
+        b3_date = day_dt.strftime("%Y-%m-%d")
+        print(f"\n{'─'*80}")
+        print(f"  DAY: {day_str} ({day_dt.strftime('%A')})")
+        print(f"{'─'*80}")
+
+        day_has_0dte = False
+        for asset in ASSET_SYMBOL:
+            try:
+                # Get spot price
+                a_daily = mt5_conn.get_data(asset, mt5.TIMEFRAME_D1, 10, 0)
+                if a_daily is None or a_daily.empty:
+                    print(f"  [{asset}] No daily data — skipped")
+                    continue
+                a_daily['date'] = a_daily['time'].dt.date
+                a_day_bar = a_daily[a_daily['date'] <= day_dt.date()]
+                if a_day_bar.empty:
+                    print(f"  [{asset}] No bar for {day_str} — skipped")
+                    continue
+                a_spot = float(a_day_bar.iloc[-1]['open'])
+                if a_spot <= 0:
+                    print(f"  [{asset}] Invalid spot ({a_spot}) — skipped")
+                    continue
+
+                # Compute GEX walls
+                if asset == "BOVA11":
+                    a_cw, a_pw, a_gf, _, _ = _compute_gex_walls_for_day(b3_date, a_spot)
+                else:
+                    from b3_options_loader import load_b3_options_data as _load_full
+                    a_df = _load_full(asset, a_spot, date=b3_date)
+                    if a_df.empty:
+                        a_cw, a_pw, a_gf = np.nan, np.nan, np.nan
+                    else:
+                        sign_a = np.where(a_df['Tipo'].str.upper().str.contains('PUT'), -1.0, 1.0)
+                        a_df['GEX_customer'] = a_df['Gamma'] * (a_spot ** 2) * a_df['Tit.'] * sign_a
+                        comb = a_df.groupby('Strike', as_index=False)['GEX_customer'].sum()
+                        abv = comb[comb['Strike'] >= a_spot]
+                        blw = comb[comb['Strike'] <= a_spot]
+                        a_cw = float(abv.loc[abv['GEX_customer'].idxmax(), 'Strike']) if not abv.empty else np.nan
+                        a_pw = float(blw.loc[blw['GEX_customer'].abs().idxmax(), 'Strike']) if not blw.empty else np.nan
+                        a_gf = find_gamma_flip(a_df, a_spot)
+
+                print(f"  [{asset}] Spot={a_spot:.2f}  CW={a_cw if np.isfinite(a_cw) else 'N/A'}  "
+                      f"PW={a_pw if np.isfinite(a_pw) else 'N/A'}  Flip={a_gf if np.isfinite(a_gf) else 'N/A'}")
+
+                # Load 0DTE chain and recommend
+                chain_0 = _load_0dte_chain(asset, a_spot, b3_date)
+                if chain_0.empty:
+                    print(f"    → No 0DTE/1DTE chain found")
+                    continue
+
+                print(f"    → 0DTE chain: {len(chain_0)} rows, DTE range: {chain_0['DTE'].min()}-{chain_0['DTE'].max()}")
+                rec = recommend_0dte_strategy(chain_0, a_spot, a_cw, a_pw, a_gf)
+                if rec:
+                    min_dte = int(chain_0['DTE'].min())
+                    dte_label = '0DTE' if min_dte == 0 else '1DTE'
+                    weekday = day_dt.strftime('%a')
+                    all_0dte_recs.append({
+                        'day': day_str, 'asset': asset,
+                        'spot': a_spot, 'dte_label': dte_label,
+                        'weekday': weekday, **rec
+                    })
+                    day_has_0dte = True
+                    rr = rec['max_reward'] / rec['max_risk'] if rec['max_risk'] > 0 else 0
+                    bes_str = ' / '.join(f"{b:.2f}" for b in rec['breakevens'])
+                    print(f"    ✓ {dte_label} | Regime: {rec['regime']}")
+                    print(f"      Strategy : {rec['strategy']}  |  Legs: {rec['legs']}")
+                    print(f"      Reason   : {rec['reason']}")
+                    print(f"      MaxRisk  : R$ {rec['max_risk']:.2f}  |  MaxReward: R$ {rec['max_reward']:.2f}  |  R:R 1:{rr:.1f}")
+                    print(f"      Breakeven: {bes_str}  |  Avg IV: {rec['iv_avg']*100:.1f}%  |  Strikes: {rec['n_strikes']}")
+                else:
+                    print(f"    → Chain found but no viable strategy (need ≥4 liquid strikes)")
+            except Exception as e:
+                print(f"  [{asset}] 0DTE error: {e}")
+
+        if not day_has_0dte:
+            print(f"  → No 0DTE/1DTE recommendations for {day_str}")
+
+    # ── Final summary table ───────────────────────────────────────────
+    if all_0dte_recs:
+        print(f"\n\n{'='*110}")
+        print(f"  SUMMARY — SHORT-DATED OPTION STRATEGIES")
+        print(f"{'='*110}")
+
+        for asset in ASSET_SYMBOL:
+            asset_recs = [r for r in all_0dte_recs if r['asset'] == asset]
+            if not asset_recs:
+                continue
+            print(f"\n  {'─'*106}")
+            print(f"  {asset:^106}")
+            print(f"  {'─'*106}")
+            print(f"  {'Day':<12} {'':>3} {'DTE':<5} {'Spot':>8} {'Regime':<16} {'Strategy':<18} "
+                  f"{'Legs':<38} {'MaxRisk':>8} {'MaxRwd':>8}")
+            print(f"  {'─'*106}")
+            for r in asset_recs:
+                print(f"  {r['day']:<12} {r.get('weekday',''):>3} {r.get('dte_label','?'):<5} {r['spot']:>8.2f} "
+                      f"{r['regime']:<16} {r['strategy']:<18} {r['legs']:<38} "
+                      f"R${r['max_risk']:>6.2f} R${r['max_reward']:>6.2f}")
+
+        print(f"\n  {'─'*96}")
+        print(f"  {'REGIME SUMMARY':^96}")
+        print(f"  {'─'*96}")
+        for asset in ASSET_SYMBOL:
+            asset_recs = [r for r in all_0dte_recs if r['asset'] == asset]
+            if not asset_recs:
+                continue
+            regimes = [r['regime'] for r in asset_recs]
+            most_common = max(set(regimes), key=regimes.count)
+            strats = [r['strategy'] for r in asset_recs]
+            most_strat = max(set(strats), key=strats.count)
+            avg_iv = np.mean([r['iv_avg'] for r in asset_recs])
+            print(f"    {asset:<8} Dominant regime: {most_common:<18} "
+                  f"Best strategy: {most_strat:<20} Avg IV: {avg_iv*100:.1f}%")
+        print(f"  {'─'*96}\n")
+    else:
+        print(f"\n  [!] No 0DTE options data available for any date in the period.\n")
 
 
 if __name__ == "__main__":

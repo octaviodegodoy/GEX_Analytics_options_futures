@@ -32,7 +32,7 @@ from constants import SHIFT_PERIODS
 
 
 # ── Configuration ────────────────────────────────────────────
-WIN_SYMBOL = "WINJ26"      # Mini Ibovespa April 2026
+WIN_SYMBOL = None           # Resolved dynamically from MT5 at runtime
 WDO_SYMBOL = "WDOK26"      # Mini Dollar  May 2026 (J expired 01-Apr)
 LOOKBACK_DAYS = 60          # trading days of daily data
 INTRADAY_DAYS = 20          # trading days of 15-min data
@@ -110,7 +110,10 @@ class KalmanSpreadFilter:
 # ═════════════════════════════════════════════════════════════
 def fetch_pair_data(mt5_conn, timeframe, periods, shift=SHIFT_PERIODS):
     """Fetch aligned price data for WIN and WDO from MT5."""
-    df_win = mt5_conn.get_data(WIN_SYMBOL, timeframe, periods, shift)
+    try:
+        df_win, _sym = mt5_conn.get_historical_futures_data("*WIN*", timeframe, periods, shift)
+    except Exception:
+        df_win = mt5_conn.get_data(WIN_SYMBOL, timeframe, periods, shift)
     df_wdo = mt5_conn.get_data(WDO_SYMBOL, timeframe, periods, shift)
 
     if df_win is None or df_wdo is None:
@@ -409,7 +412,14 @@ def print_summary(garch_daily_vol, kalman_daily_vol, garch_intra_vol,
 # 7. Main
 # ═════════════════════════════════════════════════════════════
 def main():
+    global WIN_SYMBOL
     mt5 = MT5Connector()
+
+    # Resolve WIN symbol dynamically
+    if WIN_SYMBOL is None:
+        current_win, prev_win = mt5.get_win_symbols()
+        WIN_SYMBOL = current_win
+        print(f"[i] WIN contracts: current={current_win}, previous={prev_win}")
 
     # ── Daily analysis ──────────────────────────────────────
     print("\n" + "▓" * 60)

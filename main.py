@@ -1745,6 +1745,7 @@ async def main():
     build_di1_curve(mt5_conn)
 
     # Build Kalman mapper WIN <-> BOVA11 on 15-min bars (best for intraday)
+    # Build Kalman mapper WIN <-> BOVA11 on 15-min bars (best for intraday)
     win_mapper = None
     win_symbol = ""
     expiring_symbol = None
@@ -1759,7 +1760,7 @@ async def main():
             if expiring_symbol:
                 print(f"[i] Expiring contract (data fallback): {expiring_symbol}")
         except Exception as e:
-            print(f"[!] Could not resolve current WIN symbol: {e}")
+            print(f"[!] Could not resolve WIN symbols: {e}")
             win_symbol = ""
             expiring_symbol = None
 
@@ -1771,21 +1772,19 @@ async def main():
         for ind_sym in ind_symbols_to_try:
             try:
                 win_mapper = build_ind_bova11_mapper_intraday(
-                    mt5_conn, ind_symbol=ind_sym, bova11_symbol="BOVA11"
+                    mt5_conn, ind_symbol=win_symbol, bova11_symbol="BOVA11"
                 )
-                print(f"[i] Intraday mapper built using {ind_sym}")
-                break
+                print(f"[i] Intraday mapper built using {win_symbol}")
             except Exception as e:
-                print(f"[!] Intraday mapper failed for {ind_sym}: {e}")
-                # Fallback to daily mapper with the same symbol
+                print(f"[!] Intraday mapper failed for {win_symbol}: {e}")
+                # Fallback to daily mapper
                 try:
-                    win_mapper = build_ind_bova11_mapper(mt5_conn, ind_symbol=ind_sym, bova11_symbol="BOVA11")
-                    print(f"[i] Daily mapper built using {ind_sym}")
-                    break
+                    win_mapper = build_ind_bova11_mapper(mt5_conn, ind_symbol=win_symbol, bova11_symbol="BOVA11")
+                    print(f"[i] Daily mapper built using {win_symbol}")
                 except Exception as e2:
-                    print(f"[!] Daily mapper also failed for {ind_sym}: {e2}")
+                    print(f"[!] Daily mapper also failed for {win_symbol}: {e2}")
         else:
-            print("[!] All WIN symbol attempts exhausted -- no mapper available")
+            print("[!] No WIN contract resolved -- no mapper available")
 
     bova11_gex = None
     for asset in ASSET_SYMBOL:
