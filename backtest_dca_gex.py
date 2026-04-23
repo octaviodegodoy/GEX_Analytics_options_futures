@@ -13,6 +13,8 @@ Flow per trading day:
 """
 import os
 import sys
+import asyncio
+import math
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -29,11 +31,26 @@ from constants import (
     GEX_MIN_SL_POINTS, GEX_TRAILING_DISTANCE_FACTOR,
     GEX_MAX_DAILY_LOSS_PCT, GEX_TP_AT_OPPOSITE_WALL,
     GEX_TRADE_WINDOW_START, GEX_TRADE_WINDOW_END,
+    GEX_REQUIRE_5M_CONFIRMATION, GEX_CONFIRMATION_MINUTES,
+    GEX_NEUTRAL_ONLY, GEX_NEUTRAL_MAX_FLIP_DISTANCE_PCT,
     ASSET_SYMBOL,
 )
 from gex_utils import compute_weekly_walls, find_gamma_flip, generate_gex_trade_signals
 from main import _select_significant_zones
 from bs_greeks import bs_price
+
+
+def _is_neutral_setup(spot, gamma_flip, call_wall, put_wall, max_flip_distance_pct):
+    """Neutral setup: spot between walls and close to gamma flip."""
+    if not np.isfinite(spot) or not np.isfinite(gamma_flip) or gamma_flip == 0:
+        return False
+    if np.isfinite(call_wall) and np.isfinite(put_wall):
+        lo = min(call_wall, put_wall)
+        hi = max(call_wall, put_wall)
+        if not (lo <= spot <= hi):
+            return False
+    flip_dist = abs((spot - gamma_flip) / gamma_flip)
+    return flip_dist <= max_flip_distance_pct
 
 # ── WIN contract specs ───────────────────────────────────────────────
 TICK_SIZE  = 5
@@ -165,6 +182,690 @@ def recommend_0dte_strategy(chain_0dte, spot, call_wall, put_wall, gamma_flip, r
         return None
 
     calls = chain_0dte[chain_0dte['Tipo'] == 'CALL'].sort_values('Strike')
+
+
+def _is_market_open_now():
+    """Return True when current local time is inside configured trade window on a weekday."""
+    now = datetime.now()
+    if now.weekday() >= 5:
+        return False
+    hm = now.strftime("%H:%M")
+    return GEX_TRADE_WINDOW_START <= hm <= GEX_TRADE_WINDOW_END
+
+
+def _nearest_option_row(df, opt_type, target_strike, target_expiration):
+    """Pick the nearest row by strike for option type on target expiration date."""
+    if df is None or df.empty:
+        return None
+    side = df[df['Tipo'].str.upper().str.contains(opt_type.upper())].copy()
+    if side.empty:
+        return None
+    side['Expiration'] = pd.to_datetime(side['Expiration'], errors='coerce')
+    side = side.dropna(subset=['Expiration', 'Strike'])
+    if side.empty:
+        return None
+    side = side[side['Expiration'].dt.normalize() == pd.to_datetime(target_expiration).normalize()]
+    if side.empty:
+        return None
+    side['strike_dist'] = (side['Strike'] - float(target_strike)).abs()
+    side = side.sort_values(['strike_dist', 'Strike'])
+    return side.iloc[0]
+
+
+def _build_spread_candidates(asset, spot, analysis_result):
+    """Build simple Calendar PUT and Iron Condor candidates from live chain snapshot."""
+    from b3_options_loader import load_b3_options_data
+    from bs_greeks import implied_vol, bs_gamma, bs_delta
+    from di1_rate_curve import get_rate_for_date
+    from rtd_oi_reader import read_rtd_option_snapshot
+
+    df = load_b3_options_data(asset, spot)
+    if df.empty:
+        return None
+
+    df = df.copy()
+    df['Expiration'] = pd.to_datetime(df['Expiration'], errors='coerce')
+    df = df.dropna(subset=['Expiration', 'Strike', 'Ultimo'])
+    if df.empty:
+        return None
+
+    # Prefer live RTD fields (ULT/PEX/CAB) for option price/strike/OI when available.
+    tickers = [str(t).strip().upper() for t in df['Ticker'].dropna().astype(str).unique().tolist()]
+    rtd = read_rtd_option_snapshot(tickers=tickers, attributes=['ULT', 'PEX', 'CAB'], wait_seconds=1.0, refresh_rounds=3)
+    rtd_hits = 0
+    if rtd is not None and not rtd.empty:
+        rtd['ticker'] = rtd['ticker'].astype(str).str.strip().str.upper()
+        rtd_map = rtd.set_index('ticker').to_dict(orient='index')
+
+        def _val(dct, key):
+            if dct is None:
+                return np.nan
+            try:
+                return float(dct.get(key, np.nan))
+            except (ValueError, TypeError):
+                return np.nan
+
+        for i, row in df.iterrows():
+            tk = str(row['Ticker']).strip().upper()
+            snap = rtd_map.get(tk)
+            if snap is None:
+                continue
+            ult = _val(snap, 'ult')
+            pex = _val(snap, 'pex')
+            cab = _val(snap, 'cab')
+            if np.isfinite(ult) and ult > 0:
+                df.at[i, 'Ultimo'] = ult
+                rtd_hits += 1
+            if np.isfinite(pex) and pex > 0:
+                df.at[i, 'Strike'] = pex
+            if np.isfinite(cab) and cab > 0:
+                df.at[i, 'Tit.'] = cab
+
+        # Recompute IV and Greeks from updated RTD price/strike values.
+        new_iv = []
+        new_delta = []
+        new_gamma = []
+        now_date = datetime.now().date()
+        for _, row in df.iterrows():
+            exp = pd.to_datetime(row['Expiration'], errors='coerce')
+            if pd.isna(exp):
+                T = 1 / 252.0
+                r = 0.10
+            else:
+                dte = max(int(np.busday_count(now_date, exp.date())), 0)
+                T = max(dte / 252.0, 1 / 252.0)
+                r = get_rate_for_date(exp)
+            opt_type = str(row['Tipo']).lower()
+            strike = float(row['Strike']) if np.isfinite(row['Strike']) else np.nan
+            price = float(row['Ultimo']) if np.isfinite(row['Ultimo']) else np.nan
+            if np.isfinite(price) and price > 0 and np.isfinite(strike) and strike > 0:
+                iv = implied_vol(price, spot, strike, T, r, opt_type)
+            else:
+                iv = float(row['IV']) if 'IV' in row and np.isfinite(row['IV']) else 0.30
+            new_iv.append(iv)
+            try:
+                new_delta.append(bs_delta(spot, strike, T, r, iv, opt_type))
+                new_gamma.append(bs_gamma(spot, strike, T, r, iv))
+            except Exception:
+                new_delta.append(float(row['Delta']) if 'Delta' in row and np.isfinite(row['Delta']) else np.nan)
+                new_gamma.append(float(row['Gamma']) if 'Gamma' in row and np.isfinite(row['Gamma']) else np.nan)
+
+        df['IV'] = np.array(new_iv)
+        df['Delta'] = np.array(new_delta)
+        df['Gamma'] = np.array(new_gamma)
+
+    if rtd_hits > 0:
+        print(f"[MARKET CHECK] RTD snapshot applied to {rtd_hits} option rows (ULT/PEX/CAB).")
+    else:
+        print("[MARKET CHECK] RTD snapshot unavailable for option rows; using B3-derived values.")
+
+    today = pd.Timestamp.now().normalize()
+    expirations = sorted([d for d in df['Expiration'].dt.normalize().unique() if d >= today])
+    if len(expirations) < 1:
+        return None
+
+    near_exp = expirations[0]
+    far_exp = expirations[1] if len(expirations) > 1 else expirations[0]
+
+    strike_list = sorted(df['Strike'].dropna().unique())
+    if len(strike_list) < 4:
+        return None
+    diffs = np.diff(strike_list)
+    diffs = diffs[diffs > 0]
+    strike_step = float(np.median(diffs)) if len(diffs) else 1.0
+
+    put_wall = float(analysis_result.get('put_wall', np.nan))
+    call_wall = float(analysis_result.get('call_wall', np.nan))
+    if not np.isfinite(put_wall) or not np.isfinite(call_wall):
+        return None
+
+    # Calendar PUT (long calendar): sell near-term put, buy farther-term put at same strike.
+    cal_short = _nearest_option_row(df, 'PUT', put_wall, near_exp)
+    cal_long = _nearest_option_row(df, 'PUT', put_wall, far_exp)
+    calendar_put = None
+    if cal_short is not None and cal_long is not None:
+        short_price = float(cal_short['Ultimo'])
+        long_price = float(cal_long['Ultimo'])
+        net_debit = max(long_price - short_price, 0.0)
+        calendar_put = {
+            'short_strike': float(cal_short['Strike']),
+            'long_strike': float(cal_long['Strike']),
+            'near_exp': pd.Timestamp(near_exp).strftime('%Y-%m-%d'),
+            'far_exp': pd.Timestamp(far_exp).strftime('%Y-%m-%d'),
+            'near_iv': float(cal_short['IV']) if 'IV' in cal_short else np.nan,
+            'far_iv': float(cal_long['IV']) if 'IV' in cal_long else np.nan,
+            'short_price': short_price,
+            'long_price': long_price,
+            'net_debit': net_debit,
+        }
+
+    # Iron Condor centered around walls.
+    sp = _nearest_option_row(df, 'PUT', put_wall, far_exp)
+    lp = _nearest_option_row(df, 'PUT', float(put_wall - strike_step), far_exp)
+    sc = _nearest_option_row(df, 'CALL', call_wall, far_exp)
+    lc = _nearest_option_row(df, 'CALL', float(call_wall + strike_step), far_exp)
+    iron_condor = None
+    if sp is not None and lp is not None and sc is not None and lc is not None:
+        sp_k = float(sp['Strike'])
+        lp_k = float(lp['Strike'])
+        sc_k = float(sc['Strike'])
+        lc_k = float(lc['Strike'])
+        sp_p = float(sp['Ultimo'])
+        lp_p = float(lp['Ultimo'])
+        sc_p = float(sc['Ultimo'])
+        lc_p = float(lc['Ultimo'])
+        net_credit = max((sp_p + sc_p) - (lp_p + lc_p), 0.0)
+        width_put = max(sp_k - lp_k, 0.0)
+        width_call = max(lc_k - sc_k, 0.0)
+        max_loss = max(max(width_put, width_call) - net_credit, 0.0)
+        be_low = sp_k - net_credit
+        be_high = sc_k + net_credit
+        iron_condor = {
+            'expiry': pd.Timestamp(far_exp).strftime('%Y-%m-%d'),
+            'short_put': sp_k,
+            'long_put': lp_k,
+            'short_call': sc_k,
+            'long_call': lc_k,
+            'net_credit': net_credit,
+            'max_loss': max_loss,
+            'breakeven_low': be_low,
+            'breakeven_high': be_high,
+        }
+
+    # ---------- Optimize parameters for wider profitable coverage ----------
+    def _std_norm_cdf(z):
+        return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+    def _gex_align(x, target, step_ref):
+        if not np.isfinite(x) or not np.isfinite(target):
+            return 1.0
+        denom = max(step_ref * 2.5, 1e-6)
+        return math.exp(-abs(x - target) / denom)
+
+    def _row_price(row, ttm, rate):
+        p = float(row['Ultimo']) if np.isfinite(row.get('Ultimo', np.nan)) else np.nan
+        if np.isfinite(p) and p > 0:
+            return p
+        iv = float(row['IV']) if np.isfinite(row.get('IV', np.nan)) and row.get('IV', np.nan) > 0 else 0.30
+        k = float(row['Strike'])
+        opt_type = str(row['Tipo']).lower()
+        return bs_price(spot, k, max(ttm, 1 / 252.0), rate, iv, opt_type)
+
+    near_puts = df[
+        df['Tipo'].str.upper().str.contains('PUT')
+        & (df['Expiration'].dt.normalize() == pd.to_datetime(near_exp).normalize())
+    ].copy()
+    far_puts = df[
+        df['Tipo'].str.upper().str.contains('PUT')
+        & (df['Expiration'].dt.normalize() == pd.to_datetime(far_exp).normalize())
+    ].copy()
+    far_calls = df[
+        df['Tipo'].str.upper().str.contains('CALL')
+        & (df['Expiration'].dt.normalize() == pd.to_datetime(far_exp).normalize())
+    ].copy()
+
+    near_puts = near_puts.dropna(subset=['Strike']).sort_values('Strike')
+    far_puts = far_puts.dropna(subset=['Strike']).sort_values('Strike')
+    far_calls = far_calls.dropna(subset=['Strike']).sort_values('Strike')
+
+    now_date = datetime.now().date()
+    far_dt = pd.to_datetime(far_exp)
+    near_dt = pd.to_datetime(near_exp)
+    far_dte = max(int(np.busday_count(now_date, far_dt.date())), 1)
+    near_dte = max(int(np.busday_count(now_date, near_dt.date())), 0)
+    t_far = max(far_dte / 252.0, 1 / 252.0)
+    t_near = max(near_dte / 252.0, 1 / 252.0)
+    t_near_to_far = max((far_dte - near_dte) / 252.0, 1 / 252.0)
+    r_far = get_rate_for_date(far_dt)
+    r_near = get_rate_for_date(near_dt)
+
+    iv_far_ref = float(far_puts['IV'].replace([np.inf, -np.inf], np.nan).dropna().mean()) if not far_puts.empty else 0.25
+    if not np.isfinite(iv_far_ref) or iv_far_ref <= 0:
+        iv_far_ref = 0.25
+    exp_move = max(spot * iv_far_ref * np.sqrt(t_far), strike_step)
+    wall_band = max(2.0 * strike_step, 0.8 * exp_move)
+    spot_band = max(3.0 * strike_step, 1.5 * exp_move)
+    cal_max_wall_distance = max(2.0 * strike_step, 0.45 * exp_move)
+
+    best_calendar_wide = None
+    if not near_puts.empty and not far_puts.empty:
+        strike_candidates = sorted(set(near_puts['Strike'].unique()).intersection(set(far_puts['Strike'].unique())))
+        if not strike_candidates:
+            strike_candidates = sorted(far_puts['Strike'].unique())
+
+        # Keep calendar strikes in a practical neighborhood around put wall and spot.
+        constrained_candidates = [
+            k for k in strike_candidates
+            if (abs(float(k) - put_wall) <= wall_band) and (abs(float(k) - spot) <= spot_band)
+        ]
+        if constrained_candidates:
+            strike_candidates = constrained_candidates
+        else:
+            # Hard fallback: keep only nearest strikes to put wall (do not reopen full range).
+            strike_candidates = sorted(
+                strike_candidates,
+                key=lambda k: abs(float(k) - put_wall)
+            )[:max(3, min(7, len(strike_candidates)))]
+
+        x_cal = np.linspace(max(spot - 2.0 * exp_move, strike_list[0] * 0.9),
+                            min(spot + 2.0 * exp_move, strike_list[-1] * 1.1), 300)
+
+        best_score = -np.inf
+        for k in strike_candidates:
+            if abs(float(k) - put_wall) > cal_max_wall_distance:
+                continue
+            short_row = _nearest_option_row(df, 'PUT', float(k), near_exp)
+            long_row = _nearest_option_row(df, 'PUT', float(k), far_exp)
+            if short_row is None or long_row is None:
+                continue
+
+            short_px = _row_price(short_row, t_near, r_near)
+            long_px = _row_price(long_row, t_far, r_far)
+            debit = long_px - short_px
+            if not np.isfinite(debit) or debit <= 0:
+                continue
+
+            iv_long = float(long_row['IV']) if np.isfinite(long_row.get('IV', np.nan)) and long_row.get('IV', np.nan) > 0 else iv_far_ref
+            pnl_near = np.array([
+                bs_price(s, float(long_row['Strike']), t_near_to_far, r_far, iv_long, 'put')
+                - max(float(short_row['Strike']) - s, 0.0)
+                - debit
+                for s in x_cal
+            ])
+
+            positive = pnl_near > 0
+            if not np.any(positive):
+                continue
+            frac_profitable = float(np.mean(positive))
+            idx_pos = np.where(positive)[0]
+            band = float(x_cal[idx_pos[-1]] - x_cal[idx_pos[0]]) if len(idx_pos) > 1 else 0.0
+            peak = float(np.nanmax(pnl_near))
+            peak_to_debit = peak / debit if debit > 0 else 0.0
+            align = _gex_align(float(k), put_wall, strike_step)
+            score = band * (0.4 + frac_profitable) * max(peak_to_debit, 0.1) * align
+
+            if score > best_score:
+                best_score = score
+                best_calendar_wide = {
+                    'short_strike': float(short_row['Strike']),
+                    'long_strike': float(long_row['Strike']),
+                    'near_exp': pd.Timestamp(near_exp).strftime('%Y-%m-%d'),
+                    'far_exp': pd.Timestamp(far_exp).strftime('%Y-%m-%d'),
+                    'short_price': float(short_px),
+                    'long_price': float(long_px),
+                    'net_debit': float(debit),
+                    'profit_band_width': band,
+                    'profitable_fraction': frac_profitable,
+                    'peak_pnl_near_exp': peak,
+                    'score': float(score),
+                }
+
+        if best_calendar_wide is None and calendar_put is not None:
+            # If strict optimization finds no feasible candidate, keep baseline wall-anchored calendar.
+            best_calendar_wide = {
+                **calendar_put,
+                'profit_band_width': np.nan,
+                'profitable_fraction': np.nan,
+                'peak_pnl_near_exp': np.nan,
+                'score': np.nan,
+            }
+
+    best_iron_condor_wide = None
+    if not far_puts.empty and not far_calls.empty:
+        puts_otm = far_puts[far_puts['Strike'] < spot].sort_values('Strike')
+        calls_otm = far_calls[far_calls['Strike'] > spot].sort_values('Strike')
+
+        if not puts_otm.empty and not calls_otm.empty:
+            put_shorts = puts_otm.tail(min(6, len(puts_otm)))
+            call_shorts = calls_otm.head(min(6, len(calls_otm)))
+
+            # Keep short legs near their respective GEX walls while still allowing width optimization.
+            put_shorts_c = put_shorts[
+                (put_shorts['Strike'] >= (put_wall - wall_band))
+                & (put_shorts['Strike'] <= min(spot, put_wall + wall_band))
+            ]
+            call_shorts_c = call_shorts[
+                (call_shorts['Strike'] <= (call_wall + wall_band))
+                & (call_shorts['Strike'] >= max(spot, call_wall - wall_band))
+            ]
+            if not put_shorts_c.empty:
+                put_shorts = put_shorts_c
+            if not call_shorts_c.empty:
+                call_shorts = call_shorts_c
+
+            best_score = -np.inf
+            for _, sp_row in put_shorts.iterrows():
+                sp_k = float(sp_row['Strike'])
+                lp_pool = puts_otm[puts_otm['Strike'] < sp_k].sort_values('Strike', ascending=False).head(3)
+                if lp_pool.empty:
+                    continue
+
+                for _, sc_row in call_shorts.iterrows():
+                    sc_k = float(sc_row['Strike'])
+                    lc_pool = calls_otm[calls_otm['Strike'] > sc_k].sort_values('Strike', ascending=True).head(3)
+                    if lc_pool.empty:
+                        continue
+
+                    for _, lp_row in lp_pool.iterrows():
+                        lp_k = float(lp_row['Strike'])
+                        for _, lc_row in lc_pool.iterrows():
+                            lc_k = float(lc_row['Strike'])
+                            sp_px = _row_price(sp_row, t_far, r_far)
+                            lp_px = _row_price(lp_row, t_far, r_far)
+                            sc_px = _row_price(sc_row, t_far, r_far)
+                            lc_px = _row_price(lc_row, t_far, r_far)
+                            credit = (sp_px + sc_px) - (lp_px + lc_px)
+                            if not np.isfinite(credit) or credit <= 0:
+                                continue
+
+                            width_put = sp_k - lp_k
+                            width_call = lc_k - sc_k
+                            if width_put <= 0 or width_call <= 0:
+                                continue
+
+                            max_loss = max(width_put, width_call) - credit
+                            if max_loss <= 0:
+                                continue
+
+                            be_low = sp_k - credit
+                            be_high = sc_k + credit
+                            coverage = be_high - be_low
+                            rr = credit / max_loss
+
+                            sigma = max(exp_move, strike_step)
+                            z_hi = (be_high - spot) / sigma
+                            z_lo = (be_low - spot) / sigma
+                            pop_proxy = max(_std_norm_cdf(z_hi) - _std_norm_cdf(z_lo), 0.0)
+
+                            gex_fit = _gex_align(sp_k, put_wall, strike_step) * _gex_align(sc_k, call_wall, strike_step)
+                            score = coverage * (0.35 + pop_proxy) * min(rr, 3.0) * gex_fit
+
+                            if score > best_score:
+                                best_score = score
+                                best_iron_condor_wide = {
+                                    'expiry': pd.Timestamp(far_exp).strftime('%Y-%m-%d'),
+                                    'short_put': sp_k,
+                                    'long_put': lp_k,
+                                    'short_call': sc_k,
+                                    'long_call': lc_k,
+                                    'net_credit': float(credit),
+                                    'max_loss': float(max_loss),
+                                    'breakeven_low': float(be_low),
+                                    'breakeven_high': float(be_high),
+                                    'profit_width': float(coverage),
+                                    'pop_proxy': float(pop_proxy),
+                                    'rr': float(rr),
+                                    'score': float(score),
+                                }
+
+    return {
+        'calendar_put': calendar_put,
+        'iron_condor': iron_condor,
+        'calendar_put_best_wide': best_calendar_wide,
+        'iron_condor_best_wide': best_iron_condor_wide,
+        'near_exp': pd.Timestamp(near_exp).strftime('%Y-%m-%d'),
+        'far_exp': pd.Timestamp(far_exp).strftime('%Y-%m-%d'),
+    }
+
+
+def check_market_open_spread_analysis(asset='BOVA11', force_market_hours=False):
+    """
+    Test-script helper: run live GEX/IV analysis only when market is open,
+    then print candidate Calendar PUT and Iron Condor structures.
+    """
+    if (not force_market_hours) and (not _is_market_open_now()):
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[MARKET CHECK] {now} outside configured trade window {GEX_TRADE_WINDOW_START}-{GEX_TRADE_WINDOW_END}.")
+        print("[MARKET CHECK] Skipping live spread check (run this method during market hours).")
+        return None
+
+    import MetaTrader5 as mt5
+    from mt5_connector import MT5Connector
+    from di1_rate_curve import build_di1_curve
+    from main import analyze_options
+
+    mt5_conn = MT5Connector()
+    build_di1_curve(mt5_conn)
+
+    mt5.symbol_select(asset, True)
+    tick = mt5.symbol_info_tick(asset)
+    info = mt5.symbol_info(asset)
+    spot = 0.0
+    if tick is not None and tick.bid > 0 and tick.ask > 0:
+        spot = (tick.bid + tick.ask) / 2.0
+    elif info is not None and info.last > 0:
+        spot = float(info.last)
+
+    if spot <= 0:
+        print(f"[MARKET CHECK] Could not fetch live spot for {asset}.")
+        return None
+
+    print("\n" + "=" * 78)
+    print(f"LIVE MARKET-OPEN SPREAD CHECK -- {asset}")
+    print("=" * 78)
+    print(f"Spot: {spot:.2f}")
+
+    result = asyncio.run(analyze_options(spot, asset, win_mapper=None, win_symbol='', mt5_conn=mt5_conn))
+    if not result:
+        print("[MARKET CHECK] analyze_options returned no data.")
+        return None
+
+    spreads = _build_spread_candidates(asset, spot, result)
+    if not spreads:
+        print("[MARKET CHECK] Could not build spread candidates from current chain.")
+        return result
+
+    cal = spreads.get('calendar_put')
+    ic = spreads.get('iron_condor')
+    cal_best = spreads.get('calendar_put_best_wide')
+    ic_best = spreads.get('iron_condor_best_wide')
+
+    print("\n[SPREAD CANDIDATES]")
+    print(f"Regime: {result.get('regime', 'N/A')}")
+    print(f"Call Wall: {result.get('call_wall', np.nan):.2f} | Put Wall: {result.get('put_wall', np.nan):.2f} | Flip: {result.get('gamma_flip', np.nan):.2f}")
+
+    if cal is not None:
+        rr_hint = (cal['short_price'] / cal['net_debit']) if cal['net_debit'] > 0 else np.nan
+        print("\nCalendar PUT (test candidate)")
+        print(f"  Sell PUT {cal['short_strike']:.2f} @ {cal['near_exp']} | Buy PUT {cal['long_strike']:.2f} @ {cal['far_exp']}")
+        print(f"  Near IV: {cal['near_iv']*100:.2f}% | Far IV: {cal['far_iv']*100:.2f}%")
+        print(f"  Net debit: {cal['net_debit']:.4f} | R/R hint: {rr_hint:.2f}" if np.isfinite(rr_hint) else f"  Net debit: {cal['net_debit']:.4f}")
+    else:
+        print("\nCalendar PUT (test candidate): unavailable")
+
+    if ic is not None:
+        rr = (ic['net_credit'] / ic['max_loss']) if ic['max_loss'] > 0 else np.nan
+        print("\nIron Condor (test candidate)")
+        print(f"  Sell PUT {ic['short_put']:.2f} / Buy PUT {ic['long_put']:.2f}")
+        print(f"  Sell CALL {ic['short_call']:.2f} / Buy CALL {ic['long_call']:.2f}")
+        print(f"  Expiry: {ic['expiry']} | Net credit: {ic['net_credit']:.4f} | Max loss: {ic['max_loss']:.4f}")
+        print(f"  Break-evens: {ic['breakeven_low']:.2f} / {ic['breakeven_high']:.2f}")
+        print(f"  R/R: {rr:.2f}" if np.isfinite(rr) else "  R/R: N/A (max loss near zero)")
+    else:
+        print("\nIron Condor (test candidate): unavailable")
+
+    print("\n[BEST PARAMETERS - WIDER PROFIT COVERAGE]")
+    if cal_best is not None:
+        print("Calendar PUT (optimized)")
+        print(f"  Sell PUT {cal_best['short_strike']:.2f} @ {cal_best['near_exp']} | Buy PUT {cal_best['long_strike']:.2f} @ {cal_best['far_exp']}")
+        print(f"  Net debit: {cal_best['net_debit']:.4f} | Profit-band width: {cal_best['profit_band_width']:.2f}")
+        print(f"  Profitable fraction (near-exp MTM): {cal_best['profitable_fraction']*100:.1f}% | Peak near-exp P&L: {cal_best['peak_pnl_near_exp']:.4f}")
+    else:
+        print("Calendar PUT (optimized): unavailable")
+
+    if ic_best is not None:
+        print("Iron Condor (optimized)")
+        print(f"  Sell PUT {ic_best['short_put']:.2f} / Buy PUT {ic_best['long_put']:.2f}")
+        print(f"  Sell CALL {ic_best['short_call']:.2f} / Buy CALL {ic_best['long_call']:.2f}")
+        print(f"  Net credit: {ic_best['net_credit']:.4f} | Max loss: {ic_best['max_loss']:.4f} | R/R: {ic_best['rr']:.2f}")
+        print(f"  Profit width: {ic_best['profit_width']:.2f} | POP proxy: {ic_best['pop_proxy']*100:.1f}%")
+        print(f"  Break-evens: {ic_best['breakeven_low']:.2f} / {ic_best['breakeven_high']:.2f}")
+    else:
+        print("Iron Condor (optimized): unavailable")
+
+    print("=" * 78 + "\n")
+    return {
+        'analysis': result,
+        'spreads': spreads,
+        'spot': spot,
+    }
+
+
+def plot_spread_payoff_test(asset='BOVA11', force_market_hours=False, output_path=None):
+    """
+    Test helper: run spread analysis and plot payoff curves for:
+            1) Calendar PUT (mark-to-market curves: now, near expiry, far expiry)
+      2) Iron Condor (expiry payoff)
+    """
+    import matplotlib.pyplot as plt
+    from di1_rate_curve import get_rate_for_date
+
+    payload = check_market_open_spread_analysis(
+        asset=asset,
+        force_market_hours=force_market_hours,
+    )
+    if not payload:
+        return None
+
+    spreads = payload.get('spreads', {})
+    spot = float(payload.get('spot', np.nan))
+    cal = spreads.get('calendar_put') if spreads else None
+    ic = spreads.get('iron_condor') if spreads else None
+
+    if cal is None and ic is None:
+        print("[PLOT] No spread candidates available to plot.")
+        return payload
+
+    strike_anchors = []
+    if cal is not None:
+        strike_anchors.extend([float(cal['short_strike']), float(cal['long_strike'])])
+    if ic is not None:
+        strike_anchors.extend([
+            float(ic['long_put']), float(ic['short_put']),
+            float(ic['short_call']), float(ic['long_call'])
+        ])
+    if np.isfinite(spot):
+        strike_anchors.append(spot)
+
+    lo = min(strike_anchors) * 0.90
+    hi = max(strike_anchors) * 1.10
+    x = np.linspace(lo, hi, 400)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+
+    # Calendar PUT: mark-to-market curves using B-S across evaluation horizons.
+    ax0 = axes[0]
+    if cal is not None:
+        def _safe_iv(v, fallback=0.30):
+            try:
+                x_iv = float(v)
+                if np.isfinite(x_iv) and x_iv > 0:
+                    return x_iv
+            except (ValueError, TypeError):
+                pass
+            return float(fallback)
+
+        near_dt = pd.to_datetime(cal['near_exp'], errors='coerce')
+        far_dt = pd.to_datetime(cal['far_exp'], errors='coerce')
+        today = pd.Timestamp.now().normalize()
+
+        near_dte = max(int(np.busday_count(today.date(), near_dt.date())), 0) if pd.notna(near_dt) else 1
+        far_dte = max(int(np.busday_count(today.date(), far_dt.date())), 0) if pd.notna(far_dt) else max(near_dte + 1, 1)
+
+        t_now_near = max(near_dte / 252.0, 1 / 252.0)
+        t_now_far = max(far_dte / 252.0, 1 / 252.0)
+        t_near_far = max((far_dte - near_dte) / 252.0, 1 / 252.0)
+
+        r_near = get_rate_for_date(near_dt) if pd.notna(near_dt) else 0.10
+        r_far = get_rate_for_date(far_dt) if pd.notna(far_dt) else 0.10
+
+        iv_near = _safe_iv(cal.get('near_iv', np.nan), fallback=_safe_iv(cal.get('far_iv', np.nan), 0.30))
+        iv_far = _safe_iv(cal.get('far_iv', np.nan), fallback=iv_near)
+
+        k_short = float(cal['short_strike'])
+        k_long = float(cal['long_strike'])
+        debit = float(cal['net_debit'])
+
+        val_now = np.array([
+            bs_price(s, k_long, t_now_far, r_far, iv_far, 'put')
+            - bs_price(s, k_short, t_now_near, r_near, iv_near, 'put')
+            for s in x
+        ])
+        pnl_now = val_now - debit
+
+        val_near = np.array([
+            bs_price(s, k_long, t_near_far, r_far, iv_far, 'put')
+            - max(k_short - s, 0.0)
+            for s in x
+        ])
+        pnl_near = val_near - debit
+
+        val_far = np.array([
+            max(k_long - s, 0.0) - max(k_short - s, 0.0)
+            for s in x
+        ])
+        pnl_far = val_far - debit
+
+        ax0.plot(x, pnl_now, color='#2563EB', lw=2.1, label='Now (BS MTM)')
+        ax0.plot(x, pnl_near, color='#0EA5A4', lw=2.0, ls='--', label='At near expiry (MTM)')
+        ax0.plot(x, pnl_far, color='#111827', lw=1.9, ls=':', label='At far expiry')
+        ax0.axvline(k_short, color='#DC2626', ls='--', lw=1.2, label='Short PUT strike')
+        ax0.axvline(k_long, color='#10B981', ls='--', lw=1.2, label='Long PUT strike')
+        ax0.set_title('Calendar PUT (multi-date MTM)')
+    else:
+        ax0.text(0.5, 0.5, 'Calendar PUT unavailable', ha='center', va='center', transform=ax0.transAxes)
+        ax0.set_title('Calendar PUT')
+    if np.isfinite(spot):
+        ax0.axvline(spot, color='black', ls=':', lw=1.1, label='Spot')
+    ax0.axhline(0.0, color='gray', lw=1.0)
+    ax0.set_xlabel(f'{asset} Price at Evaluation')
+    ax0.set_ylabel('P&L (price units)')
+    ax0.grid(alpha=0.25)
+    ax0.legend(loc='best', fontsize=8)
+
+    # Iron Condor: exact payoff at expiry from intrinsic legs + net credit.
+    ax1 = axes[1]
+    if ic is not None:
+        lp = float(ic['long_put'])
+        sp = float(ic['short_put'])
+        sc = float(ic['short_call'])
+        lc = float(ic['long_call'])
+        credit = float(ic['net_credit'])
+        intrinsic_loss = (
+            np.maximum(sp - x, 0.0) - np.maximum(lp - x, 0.0)
+            + np.maximum(x - sc, 0.0) - np.maximum(x - lc, 0.0)
+        )
+        pnl_ic = credit - intrinsic_loss
+        ax1.plot(x, pnl_ic, color='#7C3AED', lw=2.2, label='Iron Condor P&L')
+        ax1.axvline(lp, color='#10B981', ls='--', lw=1.1, label='Long PUT')
+        ax1.axvline(sp, color='#DC2626', ls='--', lw=1.1, label='Short PUT')
+        ax1.axvline(sc, color='#DC2626', ls='-.', lw=1.1, label='Short CALL')
+        ax1.axvline(lc, color='#10B981', ls='-.', lw=1.1, label='Long CALL')
+        if np.isfinite(ic.get('breakeven_low', np.nan)):
+            ax1.axvline(float(ic['breakeven_low']), color='gray', ls=':', lw=1.0, label='BE low')
+        if np.isfinite(ic.get('breakeven_high', np.nan)):
+            ax1.axvline(float(ic['breakeven_high']), color='gray', ls=':', lw=1.0, label='BE high')
+        ax1.set_title('Iron Condor (expiry payoff)')
+    else:
+        ax1.text(0.5, 0.5, 'Iron Condor unavailable', ha='center', va='center', transform=ax1.transAxes)
+        ax1.set_title('Iron Condor')
+    if np.isfinite(spot):
+        ax1.axvline(spot, color='black', ls=':', lw=1.1, label='Spot')
+    ax1.axhline(0.0, color='gray', lw=1.0)
+    ax1.set_xlabel(f'{asset} Price at Expiry')
+    ax1.set_ylabel('P&L (price units)')
+    ax1.grid(alpha=0.25)
+    ax1.legend(loc='best', fontsize=8)
+
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    out = output_path or f"spread_payoff_test_{asset}_{ts}.png"
+    fig.suptitle(f"{asset} - Test Payoff Curves (Calendar PUT + Iron Condor)", fontsize=12, fontweight='bold')
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fig.savefig(out, dpi=140)
+    plt.close(fig)
+    print(f"[PLOT] Saved payoff plot to: {out}")
+    payload['plot_file'] = out
+    return payload
     puts  = chain_0dte[chain_0dte['Tipo'] == 'PUT'].sort_values('Strike')
 
     if calls.empty or puts.empty:
@@ -466,6 +1167,10 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
         executed = False
         trail = None
 
+        buy_confirm_ticks = 0
+        sell_confirm_ticks = 0
+        _confirm_threshold = max(1, int((GEX_CONFIRMATION_MINUTES * 60) / 300))  # assume 5-min bars
+
         for i, bar in win_bars.iterrows():
             win_mid = (bar['high'] + bar['low']) / 2.0
             bova_spot = mapper.ind_to_bova11(win_mid)
@@ -476,6 +1181,18 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
             sig = signal['signal']
             strength = signal['strength']
 
+            buy_candidate = (sig == 'BUY' and strength >= GEX_MIN_SIGNAL_STRENGTH)
+            sell_candidate = (sig == 'SELL' and strength >= GEX_MIN_SIGNAL_STRENGTH)
+
+            buy_confirm_ticks = buy_confirm_ticks + 1 if buy_candidate else 0
+            sell_confirm_ticks = sell_confirm_ticks + 1 if sell_candidate else 0
+
+            buy_confirm_ok = (not GEX_REQUIRE_5M_CONFIRMATION) or (buy_confirm_ticks >= _confirm_threshold)
+            sell_confirm_ok = (not GEX_REQUIRE_5M_CONFIRMATION) or (sell_confirm_ticks >= _confirm_threshold)
+            neutral_ok = (not GEX_NEUTRAL_ONLY) or _is_neutral_setup(
+                bova_spot, gamma_flip_bova, call_wall_bova, put_wall_bova, GEX_NEUTRAL_MAX_FLIP_DISTANCE_PCT
+            )
+
             # ── Check entry ──────────────────────────────────
             if not executed:
                 # Time window filter
@@ -484,10 +1201,10 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
                     continue
 
                 trigger = False
-                if is_buy and sig == 'BUY' and strength >= GEX_MIN_SIGNAL_STRENGTH:
+                if is_buy and sig == 'BUY' and strength >= GEX_MIN_SIGNAL_STRENGTH and buy_confirm_ok and neutral_ok:
                     trigger = True
                     entry_price = align_tick(bar['high'])  # conservative: buy at high
-                elif not is_buy and sig == 'SELL' and strength >= GEX_MIN_SIGNAL_STRENGTH:
+                elif not is_buy and sig == 'SELL' and strength >= GEX_MIN_SIGNAL_STRENGTH and sell_confirm_ok and neutral_ok:
                     trigger = True
                     entry_price = align_tick(bar['low'])  # conservative: sell at low
 
@@ -722,24 +1439,30 @@ def main():
     mt5_conn = MT5Connector()
     build_di1_curve(mt5_conn)
 
-    # Resolve current WIN symbol
+    # Resolve current WIN symbol + expiring contract for data fallback
     try:
-        _, win_symbol = mt5_conn.get_symbol_futures("*WIN*")
+        (_, win_symbol), expiring_sym = mt5_conn.get_symbol_futures("*WIN*", include_expiring=True)
         print(f"[i] WIN contract: {win_symbol}")
+        if expiring_sym:
+            print(f"[i] Expiring contract (data fallback): {expiring_sym}")
     except Exception as e:
-        win_symbol = "WIN$N"
-        print(f"[i] Falling back to {win_symbol}: {e}")
+        print(f"[!] Could not resolve WIN futures contract: {e}")
+        return
 
     # Build Kalman mapper on 15-min intraday data (more bars = reliable fit)
+    # Trading symbol first; expiring contract as historical-data fallback
     mapper = None
-    for ind_sym in ["WIN$N", win_symbol]:
+    syms_to_try = [win_symbol]
+    if expiring_sym and expiring_sym != win_symbol:
+        syms_to_try.append(expiring_sym)
+    for sym in syms_to_try:
         try:
             mapper = build_ind_bova11_mapper_intraday(
-                mt5_conn, ind_symbol=ind_sym, bova11_symbol="BOVA11", max_days=10)
-            print(f"[i] Kalman mapper built (intraday 15m) using {ind_sym}")
+                mt5_conn, ind_symbol=sym, bova11_symbol="BOVA11", max_days=10)
+            print(f"[i] Kalman mapper built (intraday 15m) using {sym}")
             break
         except Exception as e:
-            print(f"[!] Mapper with {ind_sym} failed: {e}")
+            print(f"[!] Mapper with {sym} failed: {e}")
     if mapper is None:
         print("[!] Could not build Kalman mapper — aborting")
         return
@@ -1076,4 +1799,26 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--plot-spread-test" in sys.argv:
+        asset = "BOVA11"
+        force = "--force-market-open-check" in sys.argv
+        out = None
+        if "--asset" in sys.argv:
+            idx = sys.argv.index("--asset")
+            if idx + 1 < len(sys.argv):
+                asset = sys.argv[idx + 1].strip().upper()
+        if "--out" in sys.argv:
+            idx = sys.argv.index("--out")
+            if idx + 1 < len(sys.argv):
+                out = sys.argv[idx + 1].strip()
+        plot_spread_payoff_test(asset=asset, force_market_hours=force, output_path=out)
+    elif "--market-open-check" in sys.argv:
+        asset = "BOVA11"
+        force = "--force-market-open-check" in sys.argv
+        if "--asset" in sys.argv:
+            idx = sys.argv.index("--asset")
+            if idx + 1 < len(sys.argv):
+                asset = sys.argv[idx + 1].strip().upper()
+        check_market_open_spread_analysis(asset=asset, force_market_hours=force)
+    else:
+        main()

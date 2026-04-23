@@ -30,15 +30,20 @@ def run_sweep():
     build_di1_curve(mt5_conn)
 
     try:
-        _, win_symbol = mt5_conn.get_symbol_futures("*WIN*")
+        (_, win_symbol), expiring_sym = mt5_conn.get_symbol_futures("*WIN*", include_expiring=True)
     except:
-        win_symbol = "WIN$N"
+        print("[!] Could not resolve WIN futures contract"); return
 
     mapper = None
-    for ind_sym in ["WIN$N", win_symbol]:
+    # Try trading symbol first, then expiring contract as data fallback
+    syms_to_try = [win_symbol]
+    if expiring_sym and expiring_sym != win_symbol:
+        syms_to_try.append(expiring_sym)
+    for sym in syms_to_try:
         try:
             mapper = build_ind_bova11_mapper_intraday(
-                mt5_conn, ind_symbol=ind_sym, bova11_symbol="BOVA11", max_days=10)
+                mt5_conn, ind_symbol=sym, bova11_symbol="BOVA11", max_days=10)
+            print(f"[i] Mapper built using {sym}")
             break
         except:
             pass

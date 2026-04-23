@@ -350,19 +350,64 @@ class MT5Connector:
                 else:
                     print(f"Successfully closed position {ticket} on {symbol}")
 
-    def get_symbol_futures(self,group_name):
+    def get_symbol_futures(self, group_name, include_expiring=False):
+        """Return the current (trading) futures contract for *group_name*.
+
+        Returns
+        -------
+        (expiration_time, symbol_name)              when include_expiring=False
+        ((expiration_time, symbol_name), exp_name)   when include_expiring=True
+            exp_name is the expiring contract still alive but inside the roll
+            buffer (useful as historical-data fallback), or None.
+        """
+        import re
+        from constants import FUTURES_ROLL_BUFFER_HOURS
         futures_symbols = mt5.symbols_get(group_name)
+        if not futures_symbols:
+            raise RuntimeError(f"No symbols found matching '{group_name}'")
+
         time_now = int(time.time())
+        # Skip contracts expiring within the roll buffer (handles expiration-day roll)
+        roll_cutoff = time_now + int(FUTURES_ROLL_BUFFER_HOURS * 3600)
         next_symbols_fut = {}
+        rolling_symbols_fut = {}
         past_symbols_fut = {}
+
+        # Extract base name from group pattern (e.g. "*WIN*" -> "WIN")
+        base = group_name.replace("*", "")
+        # Pattern for real contracts: BASE + month code + 2-digit year (e.g. WINM26)
+        contract_re = re.compile(
+            rf'^{re.escape(base)}[FGHJKMNQUVXZ]\d{{2}}$', re.IGNORECASE
+        )
+
         for s in futures_symbols:
-            if s.expiration_time > time_now:
+            # Skip synthetic/continuous symbols (WIN$N, WIN$, WINFUT, etc.)
+            if not contract_re.match(s.name):
+                continue
+            if s.expiration_time > roll_cutoff:
                next_symbols_fut[s.expiration_time] = s.name
-            elif s.expiration_time < time_now:
+            elif s.expiration_time > time_now:
+               # Contract still alive but inside roll buffer (expiring today)
+               rolling_symbols_fut[s.expiration_time] = s.name
+            else:
                past_symbols_fut[s.expiration_time] = s.name
-        
+
+        if not next_symbols_fut:
+            raise RuntimeError(
+                f"No unexpired futures contracts found matching '{group_name}'. "
+                f"Candidates filtered: {[s.name for s in futures_symbols]}"
+            )
+
         sorted_next_futures = dict(sorted(next_symbols_fut.items()))
         current_symbol = list(sorted_next_futures.items())[0]
+
+        if include_expiring:
+            # Return the most recent rolling/expiring contract (if any)
+            expiring_name = None
+            if rolling_symbols_fut:
+                sorted_rolling = sorted(rolling_symbols_fut.items(), reverse=True)
+                expiring_name = sorted_rolling[0][1]
+            return current_symbol, expiring_name
 
         return current_symbol
     

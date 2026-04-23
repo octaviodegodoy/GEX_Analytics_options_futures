@@ -328,7 +328,7 @@ def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
                 f'Spot ({spot:.2f}) near {support_label} in '
                 f'negative gamma (flip at {gamma_flip:.2f}). '
                 'Dealers short gamma — high-probability bounce zone. '
-                'Confirm with 15-min reversal candle / volume spike.'
+                'Confirm with 5-min reversal candle / volume spike.'
             )
             result['strength'] = 2
         else:
@@ -370,7 +370,7 @@ def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
                 f'Spot ({spot:.2f}) near {resist_label} in '
                 f'positive gamma (flip at {gamma_flip:.2f}). '
                 'Dealers long gamma — mean-reversion rejection likely. '
-                'Confirm with 15-min rejection wick / volume drop.'
+                'Confirm with 5-min rejection wick / volume drop.'
             )
             result['strength'] = 2
         else:

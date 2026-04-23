@@ -34,6 +34,7 @@ import pandas as pd
 import os
 import sys
 import asyncio
+import math
 
 # Ensure parent dir is on sys.path for mt5_connector / get_b3_data
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +55,8 @@ from constants import GEX_MIN_SL_POINTS, GEX_TRAILING_DISTANCE_FACTOR
 from constants import GEX_MAX_DAILY_LOSS_PCT, GEX_TP_AT_OPPOSITE_WALL
 from constants import GEX_TRADE_WINDOW_START, GEX_TRADE_WINDOW_END
 from constants import GEX_PRE_TRADE_REFRESH_MIN
+from constants import GEX_REQUIRE_5M_CONFIRMATION, GEX_CONFIRMATION_MINUTES
+from constants import GEX_NEUTRAL_ONLY, GEX_NEUTRAL_MAX_FLIP_DISTANCE_PCT
 from gex_utils import find_gamma_flip, compute_weekly_walls, generate_gex_trade_signals
 from gex_plots import plot_notional_by_strike, plot_gex_all_expiry, plot_gex_weekly
 from b3_options_loader import load_b3_options_data
@@ -82,6 +85,19 @@ def _hedging_state(spot, gamma_flip):
        if dist_pct <= 0.50:
            return "DAMPED"
        return "DAMPED" if spot >= gamma_flip else "AMPLIFIED"
+
+
+def _is_neutral_setup(spot, gamma_flip, call_wall, put_wall, max_flip_distance_pct):
+       """Neutral setup: spot between walls and close to gamma flip."""
+       if not np.isfinite(spot) or not np.isfinite(gamma_flip) or gamma_flip == 0:
+           return False
+       if np.isfinite(call_wall) and np.isfinite(put_wall):
+           lo = min(call_wall, put_wall)
+           hi = max(call_wall, put_wall)
+           if not (lo <= spot <= hi):
+               return False
+       flip_dist = abs((spot - gamma_flip) / gamma_flip)
+       return flip_dist <= max_flip_distance_pct
 
 
 def _format_gex_compact(value):
@@ -672,11 +688,12 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
        print("\n" + "="*75)
        print(f"GEX SNAPSHOT SUMMARY -- {underlying}")
        print("="*75)
+       _wlabel = win_symbol if win_symbol else "WIN"
        if win_mapper is not None:
-           cw_win = f" (WIN$N {win_mapper.bova11_to_ind(call_wall):,.0f})" if np.isfinite(call_wall) else ""
-           pw_win = f" (WIN$N {win_mapper.bova11_to_ind(put_wall):,.0f})" if np.isfinite(put_wall) else ""
-           flip_win = f" (WIN$N {win_mapper.bova11_to_ind(gamma_flip):,.0f})" if np.isfinite(gamma_flip) else ""
-           spot_win = f" (WIN$N {win_mapper.bova11_to_ind(spot):,.0f})"
+           cw_win = f" ({_wlabel} {win_mapper.bova11_to_ind(call_wall):,.0f})" if np.isfinite(call_wall) else ""
+           pw_win = f" ({_wlabel} {win_mapper.bova11_to_ind(put_wall):,.0f})" if np.isfinite(put_wall) else ""
+           flip_win = f" ({_wlabel} {win_mapper.bova11_to_ind(gamma_flip):,.0f})" if np.isfinite(gamma_flip) else ""
+           spot_win = f" ({_wlabel} {win_mapper.bova11_to_ind(spot):,.0f})"
        else:
            cw_win = pw_win = flip_win = spot_win = ""
        print(f"WALLS (C/P): {(f'{call_wall:.2f}' if np.isfinite(call_wall) else 'N/A')}{cw_win} / {(f'{put_wall:.2f}' if np.isfinite(put_wall) else 'N/A')}{pw_win}")
@@ -697,7 +714,7 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
            print("\nPIN CANDIDATES (+/-5% FROM SPOT) SNAPSHOT:")
            print(f"Expiry: {pin_snapshot['expiry_label']} ({pin_dte_label})")
            if win_mapper is not None:
-               print(f"{'Strike':>10} {'WIN$N':>10} {'Dealer GEX':>14} {'Calls OI':>12} {'Puts OI':>12}")
+               print(f"{'Strike':>10} {_wlabel:>10} {'Dealer GEX':>14} {'Calls OI':>12} {'Puts OI':>12}")
                print("-" * 66)
            else:
                print(f"{'Strike':>10} {'Dealer GEX':>14} {'Calls OI':>12} {'Puts OI':>12}")
@@ -714,7 +731,7 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
 
        print("\nZONAS SIGNIFICATIVAS GEX:")
        if win_mapper is not None:
-           print(f"{'ZONA':<14} {'STRIKE':>10} {'WIN$N':>10} {'GEX':>14} {'STRENGTH':>10}")
+           print(f"{'ZONA':<14} {'STRIKE':>10} {_wlabel:>10} {'GEX':>14} {'STRENGTH':>10}")
            print("-" * 66)
        else:
            print(f"{'ZONA':<14} {'STRIKE':>10} {'GEX':>14} {'STRENGTH':>10}")
@@ -735,7 +752,7 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
            print("  N/A")
        else:
            for idx, (_, row) in enumerate(resist_zones.reset_index(drop=True).iterrows(), start=1):
-               win_str = f" (WIN$N {win_mapper.bova11_to_ind(row['Strike']):,.0f})" if win_mapper is not None else ""
+               win_str = f" ({_wlabel} {win_mapper.bova11_to_ind(row['Strike']):,.0f})" if win_mapper is not None else ""
                print(f"  {idx}. Strike {row['Strike']:.2f}{win_str} | GEX {_format_gex_compact(row['GEX_customer'])}")
 
        print("\nTOP 3 SUPPORT ZONES:")
@@ -743,26 +760,26 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
            print("  N/A")
        else:
            for idx, (_, row) in enumerate(support_zones.reset_index(drop=True).iterrows(), start=1):
-               win_str = f" (WIN$N {win_mapper.bova11_to_ind(row['Strike']):,.0f})" if win_mapper is not None else ""
+               win_str = f" ({_wlabel} {win_mapper.bova11_to_ind(row['Strike']):,.0f})" if win_mapper is not None else ""
                print(f"  {idx}. Strike {row['Strike']:.2f}{win_str} | GEX {_format_gex_compact(row['GEX_customer'])}")
    
        # Summary Snapshot
-       # Helper to format BOVA11 + WIN$N side by side
+       # Helper to format BOVA11 + WIN side by side
        def _fmt(label, bova_val):
            if not np.isfinite(bova_val):
                return f"  {label:<25s} N/A"
            if win_mapper is not None:
                win_val = win_mapper.bova11_to_ind(bova_val)
-               return f"  {label:<25s} {bova_val:>10,.2f}   |  WIN$N {win_val:>10,.0f}"
+               return f"  {label:<25s} {bova_val:>10,.2f}   |  {_wlabel} {win_val:>10,.0f}"
            return f"  {label:<25s} {bova_val:>10,.2f}"
 
        header = "BOVA11" if win_mapper is not None else underlying
-       win_hdr = "  |  WIN$N" if win_mapper is not None else ""
+       win_hdr = f"  |  {_wlabel}" if win_mapper is not None else ""
 
        print(f"\nSummary Snapshot ({header}{win_hdr}):")
        if win_mapper is not None:
            win_spot = win_mapper.bova11_to_ind(spot)
-           print(f"  {'Spot:':<25s} {spot:>10,.2f}   |  WIN$N {win_spot:>10,.0f}")
+           print(f"  {'Spot:':<25s} {spot:>10,.2f}   |  {_wlabel} {win_spot:>10,.0f}")
        else:
            print(f"  {'Spot:':<25s} {spot:>10,.2f}")
 
@@ -912,6 +929,47 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
     from rtd_oi_reader import rtd_data_changed, rtd_shutdown
     import time as _time
 
+    def _refresh_win_contract(current_symbol, current_mapper, mt5c):
+        """Re-resolve the WIN futures contract; rebuild mapper if it changed."""
+        try:
+            (_exp, new_symbol), expiring_sym = mt5c.get_symbol_futures(
+                "*WIN*", include_expiring=True
+            )
+        except Exception as e:
+            print(f"[WIN] Could not re-resolve contract: {e} — keeping {current_symbol}")
+            return current_symbol, current_mapper
+
+        if new_symbol != current_symbol:
+            ts = _dt.now().strftime("%H:%M:%S")
+            print(f"\n[{ts}] [WIN] Contract rolled: {current_symbol} → {new_symbol}")
+            # Rebuild mapper: trading symbol first, expiring contract as data fallback
+            ind_syms = [new_symbol] if new_symbol else []
+            if expiring_sym and expiring_sym not in ind_syms:
+                ind_syms.append(expiring_sym)
+            new_mapper = None
+            for ind_sym in ind_syms:
+                try:
+                    new_mapper = build_ind_bova11_mapper_intraday(
+                        mt5c, ind_symbol=ind_sym, bova11_symbol="BOVA11"
+                    )
+                    print(f"[{ts}] [WIN] Mapper rebuilt using {ind_sym}")
+                    break
+                except Exception:
+                    try:
+                        new_mapper = build_ind_bova11_mapper(
+                            mt5c, ind_symbol=ind_sym, bova11_symbol="BOVA11"
+                        )
+                        print(f"[{ts}] [WIN] Mapper rebuilt (daily) using {ind_sym}")
+                        break
+                    except Exception:
+                        pass
+            if new_mapper is not None:
+                return new_symbol, new_mapper
+            else:
+                print(f"[{ts}] [WIN] Mapper rebuild failed — keeping old mapper with new symbol")
+                return new_symbol, current_mapper
+        return current_symbol, current_mapper
+
     if support_zones is None:
         support_zones = pd.DataFrame()
     if resist_zones is None:
@@ -1014,6 +1072,9 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
     print(f"  TP at Opposite Wall: {'Yes' if GEX_TP_AT_OPPOSITE_WALL else 'No'}")
     print(f"  Budget     : R${margin_budget:,.2f} ({GEX_MARGIN_FREE_PCT:.1%} of margin_free)")
     print(f"  RTD Refresh : {'every ' + str(GEX_RTD_REFRESH_INTERVAL) + 's' if GEX_RTD_REFRESH_INTERVAL > 0 else 'disabled'}")
+    _confirm_ticks = max(1, int(math.ceil((GEX_CONFIRMATION_MINUTES * 60) / max(GEX_MONITOR_INTERVAL, 1))))
+    print(f"  5m Confirmation: {'On' if GEX_REQUIRE_5M_CONFIRMATION else 'Off'} ({_confirm_ticks} ticks)")
+    print(f"  Neutral Setup Only: {'On' if GEX_NEUTRAL_ONLY else 'Off'} (<= {GEX_NEUTRAL_MAX_FLIP_DISTANCE_PCT:.2%} from flip)")
     print(f"{'='*75}")
     print(f"  Press Ctrl+C to stop monitoring.\n")
 
@@ -1034,6 +1095,8 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
     _pre_trade_time = f"{_pre_trade_total_min // 60:02d}:{_pre_trade_total_min % 60:02d}"
     _pre_trade_refreshed = False
     _waiting_msg_printed = False
+    buy_confirm_ticks = 0
+    sell_confirm_ticks = 0
 
     tick_count = 0
     try:
@@ -1046,6 +1109,9 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                 ts_now = _dt.now().strftime("%H:%M:%S")
                 print(f"\n[{ts_now}] [PRE-TRADE] {GEX_PRE_TRADE_REFRESH_MIN}min before trading window — recalculating GEX levels...")
                 try:
+                    # Re-resolve WIN contract (handles contract rolls)
+                    win_symbol, win_mapper = _refresh_win_contract(win_symbol, win_mapper, mt5_conn)
+
                     sym_info = _mt5.symbol_info("BOVA11")
                     _pt_spot = (sym_info.bid + sym_info.ask) / 2.0 if sym_info else 0.0
                     if _pt_spot > 0:
@@ -1097,6 +1163,9 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                         ts_now = _dt.now().strftime("%H:%M:%S")
                         print(f"\n[{ts_now}] [RTD] OI file updated — recalculating GEX levels...")
                         try:
+                            # Re-resolve WIN contract (handles contract rolls)
+                            win_symbol, win_mapper = _refresh_win_contract(win_symbol, win_mapper, mt5_conn)
+
                             sym_info = _mt5.symbol_info("BOVA11")
                             rtd_spot = (sym_info.bid + sym_info.ask) / 2.0 if sym_info else 0.0
                             if rtd_spot > 0:
@@ -1169,6 +1238,18 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
             strength = signal['strength']
             tick_count += 1
 
+            buy_candidate = (sig == 'BUY' and strength >= GEX_MIN_SIGNAL_STRENGTH)
+            sell_candidate = (sig == 'SELL' and strength >= GEX_MIN_SIGNAL_STRENGTH)
+
+            buy_confirm_ticks = buy_confirm_ticks + 1 if buy_candidate else 0
+            sell_confirm_ticks = sell_confirm_ticks + 1 if sell_candidate else 0
+
+            buy_confirm_ok = (not GEX_REQUIRE_5M_CONFIRMATION) or (buy_confirm_ticks >= _confirm_ticks)
+            sell_confirm_ok = (not GEX_REQUIRE_5M_CONFIRMATION) or (sell_confirm_ticks >= _confirm_ticks)
+            neutral_ok = (not GEX_NEUTRAL_ONLY) or _is_neutral_setup(
+                bova_spot, gamma_flip, call_wall, put_wall, GEX_NEUTRAL_MAX_FLIP_DISTANCE_PCT
+            )
+
             # Log every tick (10s) with compact status
             ts = _dt.now().strftime("%H:%M:%S")
             side_status = (("BUY:DONE" if buy_executed else "BUY:wait") + " | "
@@ -1221,7 +1302,8 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
 
             if (sig == 'BUY' and strength >= GEX_MIN_SIGNAL_STRENGTH
                     and not buy_executed and np.isfinite(win_entry_buy)
-                    and _in_trade_window and _daily_loss_ok):
+                    and _in_trade_window and _daily_loss_ok
+                    and buy_confirm_ok and neutral_ok):
                 # Guard: skip if a BUY position with this magic already exists
                 _live = _mt5.positions_get(symbol=win_symbol)
                 if any(p.magic == GEX_MAGIC_NUMBER and p.type == _mt5.POSITION_TYPE_BUY
@@ -1304,7 +1386,8 @@ async def _monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
             # --- Execute SELL ---
             elif (sig == 'SELL' and strength >= GEX_MIN_SIGNAL_STRENGTH
                       and not sell_executed and np.isfinite(win_entry_sell)
-                      and _in_trade_window and _daily_loss_ok):
+                      and _in_trade_window and _daily_loss_ok
+                      and sell_confirm_ok and neutral_ok):
                 # Guard: skip if a SELL position with this magic already exists
                 _live = _mt5.positions_get(symbol=win_symbol)
                 if any(p.magic == GEX_MAGIC_NUMBER and p.type == _mt5.POSITION_TYPE_SELL
@@ -1661,22 +1744,29 @@ async def main():
     # Build DI1 term-structure once (spline-interpolated per expiry)
     build_di1_curve(mt5_conn)
 
-    # Build Kalman mapper WIN$N <-> BOVA11 on 15-min bars (best for intraday)
+    # Build Kalman mapper WIN <-> BOVA11 on 15-min bars (best for intraday)
     win_mapper = None
     win_symbol = ""
+    expiring_symbol = None
     if "BOVA11" in ASSET_SYMBOL:
         # Resolve the current WIN mini futures contract (e.g. WINM26)
+        # Also get the expiring contract (if any) for historical data fallback
         try:
-            _exp_time, win_symbol = mt5_conn.get_symbol_futures("*WIN*")
+            (_exp_time, win_symbol), expiring_symbol = mt5_conn.get_symbol_futures(
+                "*WIN*", include_expiring=True
+            )
             print(f"[i] Current WIN futures contract: {win_symbol}")
+            if expiring_symbol:
+                print(f"[i] Expiring contract (data fallback): {expiring_symbol}")
         except Exception as e:
             print(f"[!] Could not resolve current WIN symbol: {e}")
             win_symbol = ""
+            expiring_symbol = None
 
-        # Try WIN$N first; if unavailable, fall back to the current WIN contract
-        ind_symbols_to_try = ["WIN$N"]
-        if win_symbol:
-            ind_symbols_to_try.append(win_symbol)
+        # Trading symbol first; expiring contract as historical-data fallback for mapper
+        ind_symbols_to_try = [win_symbol] if win_symbol else []
+        if expiring_symbol and expiring_symbol not in ind_symbols_to_try:
+            ind_symbols_to_try.append(expiring_symbol)
 
         for ind_sym in ind_symbols_to_try:
             try:
@@ -1721,8 +1811,14 @@ async def main():
         if asset == "BOVA11" and result is not None:
             bova11_gex = result
 
-    # --- Start real-time GEX monitor on WIN futures ---
+    # --- Start real-time GEX monitor only for BOVA11 -> WIN regression flow ---
+    _assets_upper = {str(a).upper() for a in ASSET_SYMBOL}
+    _is_bova11_scope = "BOVA11" in _assets_upper
+    _is_win_symbol = bool(win_symbol) and str(win_symbol).upper().startswith("WIN")
+
     if (GEX_MONITOR_ENABLED and GEX_SEND_ORDERS
+            and _is_bova11_scope
+            and _is_win_symbol
             and bova11_gex is not None
             and win_mapper is not None and win_symbol):
         await _monitor_gex_entries(
@@ -1738,6 +1834,10 @@ async def main():
         reasons = []
         if not GEX_SEND_ORDERS:
             reasons.append("GEX_SEND_ORDERS is False")
+        if not _is_bova11_scope:
+            reasons.append("BOVA11 not in ASSET_SYMBOL (monitor restricted to BOVA11->WIN)")
+        if not _is_win_symbol:
+            reasons.append("WIN symbol not resolved/invalid (monitor restricted to WIN contracts)")
         if bova11_gex is None:
             reasons.append("BOVA11 analysis failed or not in ASSET_SYMBOL")
         if win_mapper is None:
@@ -1746,4 +1846,5 @@ async def main():
             reasons.append("WIN symbol not resolved")
         print(f"\n[GEX Monitor] Cannot start: {'; '.join(reasons)}")
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

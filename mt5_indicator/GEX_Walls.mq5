@@ -45,14 +45,17 @@ int    g_pin_count;
 double g_resist[3], g_support[3];
 int    g_resist_count, g_support_count;
 
-// WIN$N equivalents
+// WIN equivalents
 double g_win_spot, g_win_call_wall, g_win_put_wall, g_win_gamma_flip;
 double g_win_pins[5], g_win_resist[3], g_win_support[3];
 double g_win_wk_call_wall[2], g_win_wk_put_wall[2], g_win_wk_flip[2];
 bool   g_has_win;
 
-//--- Auto-detect: draw at WIN$N prices when chart is a futures symbol
+//--- Auto-detect: draw at WIN prices when chart is a futures symbol
 bool   g_use_win;
+
+//--- Contract mismatch: chart symbol vs CSV win_symbol
+bool   g_contract_mismatch;
 
 //--- Object prefix for cleanup
 #define OBJ_PREFIX "GEX_"
@@ -73,6 +76,7 @@ int OnInit()
    string chart_sym = _Symbol;
    StringToUpper(chart_sym);
    g_use_win = (StringFind(chart_sym, "WIN") >= 0 || StringFind(chart_sym, "IND") >= 0);
+   g_contract_mismatch = false;
 
    EventSetTimer(InpUpdateSec);
    ReadCSV();
@@ -224,6 +228,32 @@ void ReadCSV()
    }
 
    FileClose(handle);
+
+   // Re-evaluate g_use_win: if CSV provides a win_symbol, check
+   // whether this chart matches it or any WIN/IND chart
+   if(g_win_symbol != "")
+   {
+      string chart_sym_up = _Symbol;
+      StringToUpper(chart_sym_up);
+      g_use_win = (StringFind(chart_sym_up, "WIN") >= 0 || StringFind(chart_sym_up, "IND") >= 0);
+
+      // Detect contract mismatch: chart symbol vs current futures contract
+      string win_sym_up = g_win_symbol;
+      StringToUpper(win_sym_up);
+      if(g_use_win && StringFind(chart_sym_up, "$") < 0)  // skip continuous symbols like WIN$N
+      {
+         // Chart is on a specific contract — check if it matches
+         g_contract_mismatch = (chart_sym_up != win_sym_up);
+         if(g_contract_mismatch)
+            Print("[GEX] Contract mismatch: chart=", _Symbol, " but current contract=", g_win_symbol,
+                  ". Consider switching chart to ", g_win_symbol);
+      }
+      else
+         g_contract_mismatch = false;
+   }
+   else
+      g_contract_mismatch = false;
+
    DeleteAllObjects();
    DrawLevels();
 }
@@ -434,8 +464,14 @@ void DrawLevels()
 
       string txt = "=== GEX DASHBOARD — " + InpSymbol;
       if(g_win_symbol != "") txt += " (" + sym_tag + ")";
-      txt += " ===\n"
-         + "Regime:      " + regime_str + "\n"
+      txt += " ===\n";
+
+      // Contract mismatch warning
+      if(g_contract_mismatch)
+         txt += "!! CHART MISMATCH: " + _Symbol + " != " + g_win_symbol
+              + " - switch chart!\n";
+
+      txt += "Regime:      " + regime_str + "\n"
          + "Gamma Flip:  " + WinLabel(g_gamma_flip, g_win_gamma_flip) + "\n"
          + "Call Wall:   " + WinLabel(g_call_wall, g_win_call_wall) + "  (Resistance)\n"
          + "Put Wall:    " + WinLabel(g_put_wall, g_win_put_wall) + "  (Support)\n"
