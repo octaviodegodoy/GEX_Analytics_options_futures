@@ -10,17 +10,19 @@ PLOT_GEX = True  # Set to False to skip all GEX chart generation
 
 # --- TRADING MODE SELECTOR ---
 # Choose "CONSERVATIVE" for low-risk defaults, "MODERATE" for balanced risk
-TRADING_MODE = "CONSERVATIVE"
+TRADING_MODE = "MODERATE"
 
 # --- GEX Order & Monitor Settings (Base) ---
 GEX_SEND_ORDERS = True            # Set to True to enable order execution
 GEX_ORDER_DEVIATION = 5            # Price deviation allowed (points)
 GEX_MONITOR_INTERVAL = 5          # Spot price poll interval in seconds (faster for tighter trailing)
-GEX_MONITOR_ENABLED = False       # Set to True to start real-time GEX monitor after analysis
+GEX_MONITOR_ENABLED = True       # Set to True to start real-time GEX monitor after analysis
 GEX_RTD_REFRESH_INTERVAL = 300   # Re-read RTD OI file every N seconds (0 = disabled)
+GEX_ALLOW_LAST_PRICE_EXECUTION_FALLBACK = True  # Use tick.last for execution after quote grace when bid/ask stay unavailable
+GEX_LAST_PRICE_FALLBACK_TICKS = 6    # Number of monitor ticks without bid/ask before enabling last-price execution fallback
 
 # --- Confirmation & Setup Filters (Fixed across all modes) ---
-GEX_REQUIRE_5M_CONFIRMATION = True  # Require 5-minute directional confirmation before entry
+GEX_REQUIRE_5M_CONFIRMATION = False  # Require 5-minute directional confirmation before entry
 GEX_CONFIRMATION_MINUTES = 5        # Confirmation window in minutes
 GEX_NEUTRAL_ONLY = True             # Only enter in neutral setup (between walls and near gamma flip)
 GEX_NEUTRAL_MAX_FLIP_DISTANCE_PCT = 0.005  # Max distance to flip for neutral setup (0.5%)
@@ -32,7 +34,7 @@ _PROFILE_CONSERVATIVE = {
     'sl_risk_pct': 0.30,            # Stop loss as 30% of margin (tighter)
     'dca_max_orders': 1,            # Only 1 DCA addition (total = initial + 1)
     'min_signal_strength': 2,       # Require full signal strength
-    'wall_proximity_pct': -0.00035, # Standard offset
+    'wall_proximity_pct': -0.01000, # Wider wall-entry zone after replay diagnostics
     'trailing_activation_pct': 0.30,# Trail at 30% profit
 }
 
@@ -43,7 +45,7 @@ _PROFILE_MODERATE = {
     'sl_risk_pct': 0.40,            # Stop loss as 40% of margin
     'dca_max_orders': 3,            # Up to 3 DCA additions (total = initial + 3)
     'min_signal_strength': 2,       # Require full signal strength
-    'wall_proximity_pct': -0.00035, # Standard offset
+    'wall_proximity_pct': -0.01000, # Wider wall-entry zone after replay diagnostics
     'trailing_activation_pct': 0.30,# Trail at 30% profit
 }
 

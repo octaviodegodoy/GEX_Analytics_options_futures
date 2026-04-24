@@ -14,6 +14,7 @@ class MT5Connector:
     ORDER_TYPE_SELL = mt5.ORDER_TYPE_SELL
     TIMEFRAME_D1 = mt5.TIMEFRAME_D1
     TIMEFRAME_M15 = mt5.TIMEFRAME_M15
+    TIMEFRAME_MN1 = getattr(mt5, 'TIMEFRAME_MN1', mt5.TIMEFRAME_D1)
     
     def __init__(self):
         if not mt5.initialize():

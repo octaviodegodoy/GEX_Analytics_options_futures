@@ -15,6 +15,7 @@ import os
 import sys
 import asyncio
 import math
+from collections import Counter
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -35,7 +36,7 @@ from constants import (
     GEX_NEUTRAL_ONLY, GEX_NEUTRAL_MAX_FLIP_DISTANCE_PCT,
     ASSET_SYMBOL,
 )
-from gex_utils import compute_weekly_walls, find_gamma_flip, generate_gex_trade_signals
+from gex_utils import compute_weekly_walls, find_gamma_flip, generate_gex_trade_signals, signal_requires_neutral_filter
 from main import _select_significant_zones
 from bs_greeks import bs_price
 
@@ -68,6 +69,39 @@ MARGIN_BUDGET = FREE_MARGIN * GEX_MARGIN_FREE_PCT
 
 def align_tick(price):
     return round(round(price / TICK_SIZE) * TICK_SIZE)
+
+
+def _classify_signal_context(signal_info):
+    signal = signal_info.get('signal', 'UNKNOWN')
+    regime = signal_info.get('regime', 'UNKNOWN')
+
+    if regime == 'TRANSITION':
+        return 'near_gamma_flip_transition'
+    if signal == 'BREAKOUT_UP':
+        return 'breakout_above_call_wall'
+    if signal == 'BREAKOUT_DOWN':
+        return 'breakout_below_put_wall'
+    if signal == 'BUY':
+        return 'buy_setup'
+    if signal == 'SELL':
+        return 'sell_setup'
+    if signal == 'NEUTRAL' and regime == 'POSITIVE_GAMMA':
+        return 'positive_gamma_not_at_resistance'
+    if signal == 'NEUTRAL' and regime == 'NEGATIVE_GAMMA':
+        return 'negative_gamma_not_at_support'
+    return 'other'
+
+
+def _format_top_counts(counter_obj, limit=3):
+    if not counter_obj:
+        return 'none'
+    return ', '.join(f"{label}={count}" for label, count in counter_obj.most_common(limit))
+
+
+def _format_avg_pct(values):
+    if not values:
+        return 'n/a'
+    return f"{(sum(values) / len(values)) * 100:.2f}%"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -191,6 +225,15 @@ def _is_market_open_now():
         return False
     hm = now.strftime("%H:%M")
     return GEX_TRADE_WINDOW_START <= hm <= GEX_TRADE_WINDOW_END
+
+
+def _is_within_local_window(start_hm, end_hm, weekdays_only=True):
+    """Return True when current local time is within [start_hm, end_hm]."""
+    now = datetime.now()
+    if weekdays_only and now.weekday() >= 5:
+        return False
+    hm = now.strftime("%H:%M")
+    return str(start_hm) <= hm <= str(end_hm)
 
 
 def _nearest_option_row(df, opt_type, target_strike, target_expiration):
@@ -608,14 +651,23 @@ def _build_spread_candidates(asset, spot, analysis_result):
     }
 
 
-def check_market_open_spread_analysis(asset='BOVA11', force_market_hours=False):
+def check_market_open_spread_analysis(
+    asset='BOVA11',
+    force_market_hours=False,
+    window_start=None,
+    window_end=None,
+):
     """
-    Test-script helper: run live GEX/IV analysis only when market is open,
+    Test-script helper: run live GEX/IV analysis only when inside
+    the selected local time window,
     then print candidate Calendar PUT and Iron Condor structures.
     """
-    if (not force_market_hours) and (not _is_market_open_now()):
+    start_hm = window_start or GEX_TRADE_WINDOW_START
+    end_hm = window_end or GEX_TRADE_WINDOW_END
+
+    if (not force_market_hours) and (not _is_within_local_window(start_hm, end_hm, weekdays_only=True)):
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        print(f"[MARKET CHECK] {now} outside configured trade window {GEX_TRADE_WINDOW_START}-{GEX_TRADE_WINDOW_END}.")
+        print(f"[MARKET CHECK] {now} outside allowed window {start_hm}-{end_hm}.")
         print("[MARKET CHECK] Skipping live spread check (run this method during market hours).")
         return None
 
@@ -723,6 +775,8 @@ def plot_spread_payoff_test(asset='BOVA11', force_market_hours=False, output_pat
     payload = check_market_open_spread_analysis(
         asset=asset,
         force_market_hours=force_market_hours,
+        window_start='10:00',
+        window_end='17:00',
     )
     if not payload:
         return None
@@ -1110,7 +1164,8 @@ def _compute_gex_walls_for_day(date_str, spot):
 
 
 def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
-                 gamma_flip_bova, mapper, support_zones=None, resist_zones=None):
+                 gamma_flip_bova, mapper, support_zones=None, resist_zones=None,
+                 return_diagnostics=False):
     """
     Simulate one trading day of the DCA GEX strategy using intraday bars.
 
@@ -1146,6 +1201,7 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
         entry_sell_bova = call_wall_bova * (1.0 - GEX_WALL_PROXIMITY_PCT) if np.isfinite(call_wall_bova) else np.nan
 
     trades = []  # list of completed trade dicts
+    entry_diagnostics = {}
     daily_realized_pnl = 0.0  # track daily loss for circuit breaker
     daily_loss_limit = MARGIN_BUDGET * GEX_MAX_DAILY_LOSS_PCT
 
@@ -1166,12 +1222,24 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
 
         executed = False
         trail = None
+        side_diag = {
+            'bars': 0,
+            'in_window_bars': 0,
+            'signal_counts': Counter(),
+            'regime_counts': Counter(),
+            'context_counts': Counter(),
+            'reason_counts': Counter(),
+            'blocker_counts': Counter(),
+            'trigger_gap_samples': [],
+            'breakout_depth_samples': [],
+        }
 
         buy_confirm_ticks = 0
         sell_confirm_ticks = 0
         _confirm_threshold = max(1, int((GEX_CONFIRMATION_MINUTES * 60) / 300))  # assume 5-min bars
 
         for i, bar in win_bars.iterrows():
+            side_diag['bars'] += 1
             win_mid = (bar['high'] + bar['low']) / 2.0
             bova_spot = mapper.ind_to_bova11(win_mid)
 
@@ -1189,7 +1257,8 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
 
             buy_confirm_ok = (not GEX_REQUIRE_5M_CONFIRMATION) or (buy_confirm_ticks >= _confirm_threshold)
             sell_confirm_ok = (not GEX_REQUIRE_5M_CONFIRMATION) or (sell_confirm_ticks >= _confirm_threshold)
-            neutral_ok = (not GEX_NEUTRAL_ONLY) or _is_neutral_setup(
+            neutral_required = GEX_NEUTRAL_ONLY and signal_requires_neutral_filter(signal)
+            neutral_ok = (not neutral_required) or _is_neutral_setup(
                 bova_spot, gamma_flip_bova, call_wall_bova, put_wall_bova, GEX_NEUTRAL_MAX_FLIP_DISTANCE_PCT
             )
 
@@ -1198,6 +1267,39 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
                 # Time window filter
                 bar_time_hm = bar['time'].strftime("%H:%M") if hasattr(bar['time'], 'strftime') else "00:00"
                 if not (GEX_TRADE_WINDOW_START <= bar_time_hm <= GEX_TRADE_WINDOW_END):
+                    side_diag['blocker_counts']['time_window'] += 1
+                    continue
+
+                side_diag['in_window_bars'] += 1
+                side_diag['signal_counts'][sig] += 1
+                side_diag['regime_counts'][signal.get('regime', 'UNKNOWN')] += 1
+                side_diag['context_counts'][_classify_signal_context(signal)] += 1
+                signal_debug = signal.get('debug', {})
+                side_diag['reason_counts'][signal_debug.get('reason_code', 'unknown')] += 1
+                trigger_gap_pct = signal_debug.get('trigger_gap_pct')
+                if np.isfinite(trigger_gap_pct):
+                    side_diag['trigger_gap_samples'].append(float(trigger_gap_pct))
+                breakout_depth_pct = signal_debug.get('breakout_depth_pct')
+                if np.isfinite(breakout_depth_pct):
+                    side_diag['breakout_depth_samples'].append(float(breakout_depth_pct))
+
+                if is_buy and sig != 'BUY':
+                    side_diag['blocker_counts'][f'signal_{sig.lower()}'] += 1
+                    continue
+                if (not is_buy) and sig != 'SELL':
+                    side_diag['blocker_counts'][f'signal_{sig.lower()}'] += 1
+                    continue
+                if strength < GEX_MIN_SIGNAL_STRENGTH:
+                    side_diag['blocker_counts']['strength_below_min'] += 1
+                    continue
+                if is_buy and not buy_confirm_ok:
+                    side_diag['blocker_counts']['confirmation_pending'] += 1
+                    continue
+                if (not is_buy) and not sell_confirm_ok:
+                    side_diag['blocker_counts']['confirmation_pending'] += 1
+                    continue
+                if neutral_required and not neutral_ok:
+                    side_diag['blocker_counts']['neutral_filter'] += 1
                     continue
 
                 trigger = False
@@ -1209,6 +1311,7 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
                     entry_price = align_tick(bar['low'])  # conservative: sell at low
 
                 if trigger:
+                    side_diag['blocker_counts']['triggered'] += 1
                     vol = vol_initial
                     sl_dist = (risk_r / vol) / PNL_PER_POINT if vol > 0 else 0
                     sl_dist = round(sl_dist / TICK_SIZE) * TICK_SIZE
@@ -1427,6 +1530,10 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
                     'gamma_flip': gamma_flip_bova,
                 })
 
+        entry_diagnostics[side_label] = side_diag
+
+    if return_diagnostics:
+        return trades, entry_diagnostics
     return trades
 
 
@@ -1585,7 +1692,7 @@ def main():
         print(f"  WIN range: {day_bars['low'].min():.0f} - {day_bars['high'].max():.0f}")
 
         # ── Run simulation ────────────────────────────────────
-        day_trades = simulate_day(
+        day_trades, day_diag = simulate_day(
             day_label=day_str,
             win_bars=day_bars.reset_index(drop=True),
             bova_bars=bova_day,
@@ -1595,10 +1702,29 @@ def main():
             mapper=mapper,
             support_zones=sup_zones,
             resist_zones=res_zones,
+            return_diagnostics=True,
         )
 
         if not day_trades:
             print(f"  → No signals triggered (no trades)")
+            print(f"    Diagnostics:")
+            for side_label in ('BUY', 'SELL'):
+                diag = day_diag.get(side_label)
+                if not diag:
+                    continue
+                print(
+                    f"    {side_label:4s} in-window {diag['in_window_bars']}/{diag['bars']} bars | "
+                    f"signals: {_format_top_counts(diag['signal_counts'])}"
+                )
+                print(
+                    f"         blockers: {_format_top_counts(diag['blocker_counts'])} | "
+                    f"reasons: {_format_top_counts(diag['reason_counts'])}"
+                )
+                print(
+                    f"         contexts: {_format_top_counts(diag['context_counts'])} | "
+                    f"avg trigger gap: {_format_avg_pct(diag['trigger_gap_samples'])} | "
+                    f"avg breakout depth: {_format_avg_pct(diag['breakout_depth_samples'])}"
+                )
         for t in day_trades:
             pnl_sign = '+' if t['pnl_r'] >= 0 else ''
             print(f"  → {t['side']:4s} @ {t['entry']:>8,.0f} → {t['exit']:>8,.0f} "

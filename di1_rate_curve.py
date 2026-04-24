@@ -2,14 +2,18 @@
 """
 DI1 Interest-Rate Curve
 -----------------------
-Fetches the DI1 futures strip from MT5, builds a cubic-spline term
-structure, and returns an annualised rate for any target date.
+Fetches the risk-free curve from external or market sources, builds a
+cubic-spline term structure, and returns an annualised rate for any
+target date.
 
 Falls back to a flat SELIC rate when DI1 data is unavailable.
 """
 import numpy as np
 import pandas as pd
-from datetime import datetime
+import requests
+from datetime import datetime, timedelta
+from io import BytesIO
+import zipfile
 
 FALLBACK_RATE = 0.1425  # flat SELIC fallback
 
@@ -64,30 +68,241 @@ def _c_spline(x_data, y_data, x_eval):
 # ---------------------------------------------------------------------------
 
 _cached_curve = None  # (time_numeric, rates, base_time)
+_BCB_SERIES = (
+    (1178, 'Selic over annualizada'),
+    (432, 'Meta Selic'),
+    (11, 'Selic diaria'),
+)
+
+_FUT_MONTH_CODE = {
+    'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6,
+    'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12,
+}
+
+
+def _get_recent_business_days(max_attempts=10):
+    days = []
+    d = datetime.now()
+    while len(days) < max_attempts:
+        if d.weekday() < 5:
+            days.append(d)
+        d -= timedelta(days=1)
+    return days
+
+
+def _fetch_b3_cotahist_text(day):
+    date_str = day.strftime('%d%m%Y')
+    url = f"https://bvmf.bmfbovespa.com.br/InstDados/SerHist/COTAHIST_D{date_str}.ZIP"
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+
+    with zipfile.ZipFile(BytesIO(resp.content)) as zf:
+        txt_names = [n for n in zf.namelist() if n.upper().endswith('.TXT')]
+        if not txt_names:
+            return None
+        with zf.open(txt_names[0]) as f:
+            return f.read().decode('latin-1', errors='ignore')
+
+
+def _parse_maturity_from_ticker(ticker, expiration):
+    # Prefer COTAHIST expiration when available.
+    if expiration and expiration not in {'00000000', '99991231'}:
+        try:
+            return datetime.strptime(expiration, '%Y%m%d')
+        except ValueError:
+            pass
+
+    # Fallback: DI1 month-code + YY, e.g. DI1F27.
+    if len(ticker) >= 6 and ticker.startswith('DI1'):
+        month = _FUT_MONTH_CODE.get(ticker[3].upper())
+        yy = ticker[4:6]
+        if month and yy.isdigit():
+            year = 2000 + int(yy)
+            return datetime(year, month, 1)
+    return None
+
+
+def _rate_from_close(close, quote_date, maturity):
+    if close is None or not np.isfinite(close) or close <= 0:
+        return None
+
+    # DI1 in many feeds is already in percent (e.g., 13.45).
+    if close <= 100.0:
+        rate = close / 100.0 if close > 2.0 else close
+        return rate if -0.05 <= rate <= 1.5 else None
+
+    # On B3, DI1 may come as PU (around 100000).
+    if maturity is None:
+        return None
+
+    du = int(np.busday_count(quote_date.date(), maturity.date()))
+    if du <= 0:
+        return None
+
+    rate = (100000.0 / close) ** (252.0 / du) - 1.0
+    return rate if -0.05 <= rate <= 1.5 else None
+
+
+def _build_curve_from_mt5(mt5_conn):
+    candidates = [
+        ('DI1$', mt5_conn.TIMEFRAME_D1, 120),
+        ('DI1@', mt5_conn.TIMEFRAME_D1, 120),
+        ('DI1@', mt5_conn.TIMEFRAME_MN1, 24),
+        ('DI1', mt5_conn.TIMEFRAME_D1, 120),
+    ]
+
+    for symbol, timeframe, bars in candidates:
+        try:
+            data = mt5_conn.get_data(symbol, timeframe, bars, 0)
+        except Exception:
+            data = None
+
+        if data is None or data.empty or 'time' not in data.columns or 'close' not in data.columns:
+            continue
+
+        d = data.sort_values('time', ascending=True).drop_duplicates(subset='time').copy()
+        d['time'] = pd.to_datetime(d['time'])
+        d['rate'] = d['close'].apply(lambda x: _rate_from_close(float(x), d['time'].iloc[-1], None))
+        d = d.dropna(subset=['rate'])
+        if len(d) < 2:
+            continue
+
+        base_time = d['time'].iloc[0].to_pydatetime()
+        time_numeric = (d['time'] - d['time'].iloc[0]).dt.total_seconds() / 86400.0
+        rates = d['rate'].values.astype(float)
+        print(f"[DI1] Curve built from MT5 {symbol}: {len(rates)} points")
+        return (time_numeric.values, rates, base_time)
+
+    return None
+
+
+def _build_curve_from_bcb():
+    """Build a flat risk-free curve from Banco Central SGS series."""
+    for series_id, label in _BCB_SERIES:
+        url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados/ultimos/5?formato=json"
+        try:
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception:
+            continue
+
+        if not payload:
+            continue
+
+        for row in reversed(payload):
+            try:
+                quote_date = datetime.strptime(row['data'], '%d/%m/%Y')
+                raw_value = float(str(row['valor']).replace(',', '.'))
+            except Exception:
+                continue
+
+            if series_id == 11:
+                rate = (1.0 + raw_value / 100.0) ** 252 - 1.0
+            else:
+                rate = raw_value / 100.0
+
+            if not np.isfinite(rate) or not (-0.05 <= rate <= 1.5):
+                continue
+
+            horizon_days = np.array([0.0, 3650.0], dtype=float)
+            rates = np.array([rate, rate], dtype=float)
+            print(f"[DI1] Curve built from BCB SGS {series_id} ({label}): {rate * 100:.2f}%")
+            return (horizon_days, rates, quote_date)
+
+    return None
+
+
+def _build_curve_from_b3(max_attempts=7):
+    records = []
+
+    for day in _get_recent_business_days(max_attempts=max_attempts):
+        try:
+            content = _fetch_b3_cotahist_text(day)
+        except Exception:
+            content = None
+
+        if not content:
+            continue
+
+        for line in content.splitlines():
+            if len(line) < 210 or line[0:2] != '01':
+                continue
+
+            ticker = line[12:24].strip()
+            if not ticker.startswith('DI1'):
+                continue
+
+            quote_raw = line[2:10].strip()
+            exp_raw = line[202:210].strip()
+            close_raw = line[108:121].strip()
+
+            try:
+                quote_date = datetime.strptime(quote_raw, '%Y%m%d')
+                close = int(close_raw) / 100.0
+            except Exception:
+                continue
+
+            maturity = _parse_maturity_from_ticker(ticker, exp_raw)
+            if maturity is None or maturity <= quote_date:
+                continue
+
+            rate = _rate_from_close(close, quote_date, maturity)
+            if rate is None:
+                continue
+
+            du = int(np.busday_count(quote_date.date(), maturity.date()))
+            if du <= 0:
+                continue
+
+            records.append((quote_date, ticker, du, rate))
+
+        if records:
+            break
+
+    if not records:
+        return None
+
+    # Use only the freshest quote day available.
+    latest_qd = max(r[0] for r in records)
+    latest = [r for r in records if r[0] == latest_qd]
+
+    df = pd.DataFrame(latest, columns=['quote_date', 'ticker', 'du', 'rate'])
+    # Keep one point per maturity bucket.
+    df = df.groupby('du', as_index=False)['rate'].mean().sort_values('du')
+    if len(df) < 2:
+        return None
+
+    print(f"[DI1] Curve built from B3 COTAHIST: {len(df)} maturities ({latest_qd.date()})")
+    return (df['du'].values.astype(float), df['rate'].values.astype(float), latest_qd)
 
 
 def build_di1_curve(mt5_conn):
-    """Fetch DI1 monthly closes from MT5 and cache the curve arrays.
+    """Fetch the risk-free curve and cache the curve arrays.
 
     Returns True if data was loaded, False on failure (fallback will be used).
     """
     global _cached_curve
     try:
-        data = mt5_conn.get_data("DI1$", mt5_conn.TIMEFRAME_D1, 120, 0)
-        if data is None or data.empty:
-            print("[DI1] No DI1$ data from MT5 — using flat SELIC fallback")
-            _cached_curve = None
-            return False
+        bcb_curve = _build_curve_from_bcb()
+        if bcb_curve is not None:
+            _cached_curve = bcb_curve
+            return True
 
-        data = data.sort_values('time', ascending=True).drop_duplicates(subset='time')
-        base_time = data['time'].iloc[0]
-        time_numeric = (data['time'] - base_time).dt.total_seconds() / 86400.0
-        rates = data['close'].values / 100.0  # DI1 prices are in % -> decimal
+        mt5_curve = _build_curve_from_mt5(mt5_conn)
+        if mt5_curve is not None:
+            _cached_curve = mt5_curve
+            return True
 
-        _cached_curve = (time_numeric.values, rates, base_time)
-        print(f"[DI1] Curve built: {len(rates)} points, range "
-              f"{data['time'].iloc[0].date()} -> {data['time'].iloc[-1].date()}")
-        return True
+        print("[DI1] External BCB source unavailable. Trying MT5/B3 fallbacks...")
+        b3_curve = _build_curve_from_b3(max_attempts=7)
+        if b3_curve is not None:
+            _cached_curve = b3_curve
+            return True
+
+        print("[DI1] No external/market rate data — using flat SELIC fallback")
+        _cached_curve = None
+        return False
     except Exception as e:
         print(f"[DI1] Failed to build curve: {e} -- using flat SELIC fallback")
         _cached_curve = None
