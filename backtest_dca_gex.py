@@ -36,7 +36,7 @@ from constants import (
     ASSET_SYMBOL,
 )
 from gex_utils import compute_weekly_walls, find_gamma_flip, generate_gex_trade_signals
-from main import _select_significant_zones
+from gex_zones import select_significant_zones as _select_significant_zones
 from bs_greeks import bs_price
 
 
@@ -1149,17 +1149,39 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
     daily_realized_pnl = 0.0  # track daily loss for circuit breaker
     daily_loss_limit = MARGIN_BUDGET * GEX_MAX_DAILY_LOSS_PCT
 
-    # TP levels in WIN terms (opposite wall)
-    win_tp_buy = win_call_wall  # BUY exits at call wall
-    win_tp_sell = win_put_wall  # SELL exits at put wall
+    # ── Signal diagnostics (per-day) ─────────────────────────
+    sig_counter = {'BUY': 0, 'SELL': 0, 'BREAKOUT_UP': 0, 'BREAKOUT_DOWN': 0,
+                   'NEUTRAL': 0, 'TRANSITION': 0, 'OTHER': 0}
+    diag = {'eligible_buy_bars': 0, 'eligible_sell_bars': 0,
+            'rejected_no_target': 0, 'rejected_window': 0}
+
+    # TP levels in WIN terms — nearest opposite-side S/R zone, fallback to wall
+    # BUY enters at nearest support → exits at nearest resistance above entry
+    tp_buy_bova = np.nan
+    if resist_zones is not None and not resist_zones.empty and np.isfinite(entry_buy_bova):
+        above = resist_zones[resist_zones['Strike'] > entry_buy_bova]
+        if not above.empty:
+            tp_buy_bova = float(above['Strike'].min())
+    if not np.isfinite(tp_buy_bova):
+        tp_buy_bova = call_wall_bova
+    win_tp_buy = mapper.bova11_to_ind(tp_buy_bova) if np.isfinite(tp_buy_bova) else np.nan
+
+    # SELL enters at nearest resistance → exits at nearest support below entry
+    tp_sell_bova = np.nan
+    if support_zones is not None and not support_zones.empty and np.isfinite(entry_sell_bova):
+        below = support_zones[support_zones['Strike'] < entry_sell_bova]
+        if not below.empty:
+            tp_sell_bova = float(below['Strike'].max())
+    if not np.isfinite(tp_sell_bova):
+        tp_sell_bova = put_wall_bova
+    win_tp_sell = mapper.bova11_to_ind(tp_sell_bova) if np.isfinite(tp_sell_bova) else np.nan
 
     # Per-side state
     for side_label, is_buy, entry_bova in [
         ('BUY', True, entry_buy_bova),
         ('SELL', False, entry_sell_bova)
     ]:
-        if not np.isfinite(entry_bova):
-            continue
+        # Note: entry_bova is no longer required — zones are computed per-bar.
         # Daily loss circuit breaker
         if daily_realized_pnl <= -daily_loss_limit:
             continue
@@ -1181,6 +1203,13 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
             sig = signal['signal']
             strength = signal['strength']
 
+            # diagnostics
+            sig_counter[sig if sig in sig_counter else 'OTHER'] = sig_counter.get(sig if sig in sig_counter else 'OTHER', 0) + 1
+            if is_buy and sig == 'BUY' and strength >= GEX_MIN_SIGNAL_STRENGTH:
+                diag['eligible_buy_bars'] += 1
+            if (not is_buy) and sig == 'SELL' and strength >= GEX_MIN_SIGNAL_STRENGTH:
+                diag['eligible_sell_bars'] += 1
+
             buy_candidate = (sig == 'BUY' and strength >= GEX_MIN_SIGNAL_STRENGTH)
             sell_candidate = (sig == 'SELL' and strength >= GEX_MIN_SIGNAL_STRENGTH)
 
@@ -1201,12 +1230,62 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
                     continue
 
                 trigger = False
-                if is_buy and sig == 'BUY' and strength >= GEX_MIN_SIGNAL_STRENGTH and buy_confirm_ok and neutral_ok:
+                # Dynamic per-bar zone selection: nearest support BELOW spot,
+                # nearest resistance ABOVE spot. Fire when bar pierces zone
+                # OR comes within GEX_WALL_PROXIMITY_PCT of it.
+                bar_low_bova = mapper.ind_to_bova11(bar['low'])
+                bar_high_bova = mapper.ind_to_bova11(bar['high'])
+                prox = GEX_WALL_PROXIMITY_PCT
+
+                nearest_sup_bova = np.nan
+                if support_zones is not None and not support_zones.empty:
+                    sup_below = support_zones[support_zones['Strike'] <= bar_high_bova * (1.0 + prox)]
+                    if not sup_below.empty:
+                        nearest_sup_bova = float(sup_below['Strike'].max())
+                if not np.isfinite(nearest_sup_bova) and np.isfinite(put_wall_bova):
+                    nearest_sup_bova = put_wall_bova
+
+                nearest_res_bova = np.nan
+                if resist_zones is not None and not resist_zones.empty:
+                    res_above = resist_zones[resist_zones['Strike'] >= bar_low_bova * (1.0 - prox)]
+                    if not res_above.empty:
+                        nearest_res_bova = float(res_above['Strike'].min())
+                if not np.isfinite(nearest_res_bova) and np.isfinite(call_wall_bova):
+                    nearest_res_bova = call_wall_bova
+
+                buy_level_win = mapper.bova11_to_ind(nearest_sup_bova) if np.isfinite(nearest_sup_bova) else np.nan
+                sell_level_win = mapper.bova11_to_ind(nearest_res_bova) if np.isfinite(nearest_res_bova) else np.nan
+
+                # Touch within proximity band
+                buy_touch = (np.isfinite(buy_level_win)
+                             and bar['low'] <= buy_level_win * (1.0 + prox))
+                sell_touch = (np.isfinite(sell_level_win)
+                              and bar['high'] >= sell_level_win * (1.0 - prox))
+
+                if (is_buy and sig == 'BUY' and strength >= GEX_MIN_SIGNAL_STRENGTH
+                        and buy_confirm_ok and neutral_ok and buy_touch):
                     trigger = True
-                    entry_price = align_tick(bar['high'])  # conservative: buy at high
-                elif not is_buy and sig == 'SELL' and strength >= GEX_MIN_SIGNAL_STRENGTH and sell_confirm_ok and neutral_ok:
+                    # Enter at zone level if reached, else at bar low (best fill)
+                    entry_price = align_tick(max(buy_level_win, bar['low']))
+                elif (not is_buy and sig == 'SELL' and strength >= GEX_MIN_SIGNAL_STRENGTH
+                        and sell_confirm_ok and neutral_ok and sell_touch):
                     trigger = True
-                    entry_price = align_tick(bar['low'])  # conservative: sell at low
+                    entry_price = align_tick(min(sell_level_win, bar['high']))
+
+                # Per-trade TP: opposite side zone (must be on profit side)
+                if trigger:
+                    if is_buy and np.isfinite(sell_level_win) and sell_level_win > entry_price:
+                        trade_tp_win = sell_level_win
+                    elif (not is_buy) and np.isfinite(buy_level_win) and buy_level_win < entry_price:
+                        trade_tp_win = buy_level_win
+                    else:
+                        # No valid opposite zone → fall back to wall TP
+                        trade_tp_win = win_tp_buy if is_buy else win_tp_sell
+                    # Reject if TP is on the wrong side
+                    if is_buy and (not np.isfinite(trade_tp_win) or trade_tp_win <= entry_price):
+                        trigger = False
+                    elif (not is_buy) and (not np.isfinite(trade_tp_win) or trade_tp_win >= entry_price):
+                        trigger = False
 
                 if trigger:
                     vol = vol_initial
@@ -1218,10 +1297,11 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
                     else:
                         sl_price = align_tick(entry_price + sl_dist)
 
-                    # TP at opposite wall
+                    # TP from the per-bar dynamic zone (set above when trigger
+                    # fired). Already validated to be on the profit side.
                     tp_price = np.nan
-                    if GEX_TP_AT_OPPOSITE_WALL:
-                        tp_price = win_tp_buy if is_buy else win_tp_sell
+                    if GEX_TP_AT_OPPOSITE_WALL and np.isfinite(trade_tp_win):
+                        tp_price = align_tick(trade_tp_win)
 
                     trail = {
                         'entry': entry_price, 'avg_entry': entry_price,
@@ -1427,10 +1507,18 @@ def simulate_day(day_label, win_bars, bova_bars, call_wall_bova, put_wall_bova,
                     'gamma_flip': gamma_flip_bova,
                 })
 
+    # Print per-day diagnostic
+    print(f"  [diag] sig: BUY={sig_counter['BUY']} SELL={sig_counter['SELL']} "
+          f"BO↑={sig_counter['BREAKOUT_UP']} BO↓={sig_counter['BREAKOUT_DOWN']} "
+          f"NEU={sig_counter['NEUTRAL']} TR={sig_counter['TRANSITION']} | "
+          f"eligible bars: BUY={diag['eligible_buy_bars']} SELL={diag['eligible_sell_bars']}")
+    print(f"  [diag] entry/TP (BOVA): BUY {entry_buy_bova:.2f}->{tp_buy_bova:.2f}  "
+          f"SELL {entry_sell_bova:.2f}->{tp_sell_bova:.2f}")
+
     return trades
 
 
-def main():
+def main(lookback_days: int = 5):
     import MetaTrader5 as mt5
     from mt5_connector import MT5Connector
     from di1_rate_curve import build_di1_curve
@@ -1481,13 +1569,13 @@ def main():
                 continue
 
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    # Last 5 business days (Mon-Fri) before today that have cached data
+    # Last N business days (Mon-Fri) before today that have cached data
     last_week = [d for d in cached_dates
                  if d < today and d.weekday() < 5]
-    last_week = sorted(last_week)[-5:]  # last 5 trading days
+    last_week = sorted(last_week)[-int(lookback_days):]  # last N trading days
 
     if not last_week:
-        print("[!] No cached B3 data for last week. Run main.py first to cache data.")
+        print(f"[!] No cached B3 data for the last {lookback_days} trading days. Run main.py first to cache data.")
         return
 
     print(f"\n{'='*80}")
@@ -1998,4 +2086,12 @@ if __name__ == "__main__":
                 asset = sys.argv[idx + 1].strip().upper()
         check_market_open_spread_analysis(asset=asset, force_market_hours=force)
     else:
-        main()
+        days = 5
+        if "--days" in sys.argv:
+            idx = sys.argv.index("--days")
+            if idx + 1 < len(sys.argv):
+                try:
+                    days = int(sys.argv[idx + 1])
+                except ValueError:
+                    print(f"[!] Invalid --days value: {sys.argv[idx + 1]}; using {days}")
+        main(lookback_days=days)

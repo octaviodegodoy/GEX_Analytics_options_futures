@@ -258,16 +258,23 @@ def build_ind_bova11_mapper(mt5_conn,
 # B3 regular session: ~7 hours = 28 bars of 15 min per day
 BARS_PER_DAY_15M = 28
 
+# ── Sanity guards for log-space (IND ≈ 1000 × BOVA11 → log-beta ≈ 1.0) ──
+MIN_LOOKBACK_DAYS = 5         # short windows fit intraday noise → unstable beta
+MIN_ALIGNED_BARS = 100        # need at least ~3.5 days of overlap to fit reliably
+LOG_BETA_MIN = 0.70           # plausible structural log-slope lower bound
+LOG_BETA_MAX = 1.30           # plausible structural log-slope upper bound
+
 
 def _build_candidate_days(max_days: int) -> list:
     """Generate candidate lookback periods up to max_days.
-    
-    Always includes 1, 2, 3 and then adds 5, 10, 15, 20 if they fit.
-    This ensures we always test short windows plus whatever the user sets.
+
+    Always includes a few sensible windows (>= MIN_LOOKBACK_DAYS) plus
+    whatever the user sets via PERIODS. Very short windows (1-3 days)
+    are excluded because they overfit intraday noise and produce
+    unstable log-betas (often 2-3x the true structural ~1.0).
     """
-    base = [1, 2, 3, 5, 10, 15, 20]
-    # Include max_days itself if not already in the list
-    candidates = sorted(set([d for d in base if d <= max_days] + [max_days]))
+    base = [5, 10, 15, 20, 30]
+    candidates = sorted(set([d for d in base if d <= max_days] + [max(max_days, MIN_LOOKBACK_DAYS)]))
     return candidates
 
 
@@ -336,7 +343,7 @@ def build_ind_bova11_mapper_intraday(
         merged = df_i.join(df_b, how='inner').dropna()
         merged = merged[(merged['ind'] > 0) & (merged['bova11'] > 0)]
 
-        if len(merged) < 10:
+        if len(merged) < max(10, MIN_ALIGNED_BARS):
             results_table.append((days, n_bars, len(merged), np.nan, "too few bars"))
             continue
 
@@ -360,6 +367,16 @@ def build_ind_bova11_mapper_intraday(
             initial_beta=ols_coeffs[0],
         )
         mapper.fit(train_ind, train_bova)
+
+        # Sanity check: log-beta should be ~1.0 (IND ≈ 1000 × BOVA11).
+        # If the fit lands far outside the plausible range it overfit noise
+        # — reject this candidate so the selector cannot pick it.
+        if not (LOG_BETA_MIN <= mapper.beta <= LOG_BETA_MAX):
+            results_table.append(
+                (days, n_bars, len(merged), np.nan,
+                 f"beta={mapper.beta:.2f} OOR")
+            )
+            continue
 
         # Evaluate on test -- step through with updates
         errors = []
@@ -405,13 +422,28 @@ def build_ind_bova11_mapper_intraday(
 
     lookback = min(60, len(merged))
     ols_coeffs = np.polyfit(bova_log[-lookback:], ind_log[-lookback:], 1)
+    seed_beta = ols_coeffs[0]
+
+    # If OLS seed is implausible (e.g. tiny lookback, broker glitch), fall
+    # back to the structural prior of log-beta=1.0 (IND \u2248 1000 \u00d7 BOVA11).
+    if not (LOG_BETA_MIN <= seed_beta <= LOG_BETA_MAX):
+        print(f"  [!] OLS seed beta={seed_beta:.3f} out of range "
+              f"[{LOG_BETA_MIN},{LOG_BETA_MAX}] \u2014 falling back to structural prior beta=1.0")
+        seed_beta = 1.0
 
     final_mapper = KalmanPriceMapper(
         delta=delta,
         observation_noise=observation_noise,
-        initial_beta=ols_coeffs[0],
+        initial_beta=seed_beta,
     )
     results_df = final_mapper.fit(ind_log, bova_log)
+
+    # Final sanity guard on the fitted log-beta.
+    if not (LOG_BETA_MIN <= final_mapper.beta <= LOG_BETA_MAX):
+        print(f"  [!] Final fit beta={final_mapper.beta:.3f} out of range \u2014 "
+              f"clamping to structural prior (alpha=ln(1000), beta=1.0)")
+        final_mapper.state[0] = float(np.log(1000.0))
+        final_mapper.state[1] = 1.0
 
     print(f"\n  Winner: {best_days} days ({len(merged)} bars of 15-min)")
     print(f"  MAE:    {best_mae:.1f} index points")

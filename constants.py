@@ -6,23 +6,23 @@ CALL_OPTION = 0
 UNIX_DAYS_IN_SECONDS = 60*60*24
 MIN_DAYS_TO_EXPIRY = 35*UNIX_DAYS_IN_SECONDS # 45 days in seconds
 ASSET_SYMBOL = ["BOVA11", "VALE3","HASH11","PETR4","ITUB4","BBAS3"] #, "GOAU4", "BBAS3", "BRAV3", "ITUB4", "BBDC4", "MGLU3", "RAIZ4"]
-PLOT_GEX = True  # Set to False to skip all GEX chart generation
+PLOT_GEX = False  # Set to False to skip all GEX chart generation
 
 # --- TRADING MODE SELECTOR ---
 # Choose "CONSERVATIVE" for low-risk defaults, "MODERATE" for balanced risk
-TRADING_MODE = "CONSERVATIVE"
+TRADING_MODE = "MODERATE"
 
 # --- GEX Order & Monitor Settings (Base) ---
 GEX_SEND_ORDERS = True            # Set to True to enable order execution
 GEX_ORDER_DEVIATION = 5            # Price deviation allowed (points)
 GEX_MONITOR_INTERVAL = 5          # Spot price poll interval in seconds (faster for tighter trailing)
-GEX_MONITOR_ENABLED = False       # Set to True to start real-time GEX monitor after analysis
+GEX_MONITOR_ENABLED = True       # Set to True to start real-time GEX monitor after analysis
 GEX_RTD_REFRESH_INTERVAL = 300   # Re-read RTD OI file every N seconds (0 = disabled)
 
 # --- Confirmation & Setup Filters (Fixed across all modes) ---
-GEX_REQUIRE_5M_CONFIRMATION = True  # Require 5-minute directional confirmation before entry
+GEX_REQUIRE_5M_CONFIRMATION = False  # Require 5-minute directional confirmation before entry
 GEX_CONFIRMATION_MINUTES = 5        # Confirmation window in minutes
-GEX_NEUTRAL_ONLY = True             # Only enter in neutral setup (between walls and near gamma flip)
+GEX_NEUTRAL_ONLY = False            # Only enter in neutral setup (between walls and near gamma flip)
 GEX_NEUTRAL_MAX_FLIP_DISTANCE_PCT = 0.005  # Max distance to flip for neutral setup (0.5%)
 
 # --- PROFILE: CONSERVATIVE (Low risk, smaller size, fewer DCA) ---
@@ -32,18 +32,18 @@ _PROFILE_CONSERVATIVE = {
     'sl_risk_pct': 0.30,            # Stop loss as 30% of margin (tighter)
     'dca_max_orders': 1,            # Only 1 DCA addition (total = initial + 1)
     'min_signal_strength': 2,       # Require full signal strength
-    'wall_proximity_pct': -0.00035, # Standard offset
+    'wall_proximity_pct': 0.005,    # Bracket the wall (±0.5%) so spot can land in zone
     'trailing_activation_pct': 0.30,# Trail at 30% profit
 }
 
 # --- PROFILE: MODERATE (Balanced risk, standard sizing) ---
 _PROFILE_MODERATE = {
     'order_volume': 1.0,            # Standard initial size
-    'margin_free_pct': 0.05,        # Use 5% of free margin as total budget
+    'margin_free_pct': 0.15,        # Use 15% of free margin as total budget
     'sl_risk_pct': 0.40,            # Stop loss as 40% of margin
     'dca_max_orders': 3,            # Up to 3 DCA additions (total = initial + 3)
     'min_signal_strength': 2,       # Require full signal strength
-    'wall_proximity_pct': -0.00035, # Standard offset
+    'wall_proximity_pct': 0.005,    # Bracket the wall (±0.5%) so spot can land in zone
     'trailing_activation_pct': 0.30,# Trail at 30% profit
 }
 
