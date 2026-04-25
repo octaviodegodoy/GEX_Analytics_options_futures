@@ -29,6 +29,8 @@ Usage:
 import os
 import time
 import pandas as pd
+import re
+import unicodedata
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MQL5_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..'))
@@ -42,13 +44,14 @@ PROFIT_RTD_SUFFIX = "B_0"  # Bovespa
 
 # Column name aliases for CSV fallback — Profit Pro uses Portuguese headers
 _TICKER_ALIASES = {
-    'codigo', 'codneg', 'ticker', 'symbol', 'ativo', 'serie',
+    'codigo', 'codneg', 'ticker', 'symbol', 'asset', 'ativo', 'serie',
     'cod', 'instrumento', 'opcao',
 }
 _OI_ALIASES = {
     'qtd.aberta', 'qtd_aberta', 'qtdaberta', 'posição', 'posicao',
     'contratos_abertos', 'open_interest', 'openinterest', 'oi',
     'pos.aberta', 'pos_aberta', 'posaberta', 'contratos',
+    'cont.abertos', 'cont_abertos', 'contabertos', 'cab',
 }
 _STRIKE_ALIASES = {
     'strike', 'exercicio', 'preco_exercicio', 'preço_exercício',
@@ -57,6 +60,15 @@ _STRIKE_ALIASES = {
 _TYPE_ALIASES = {
     'tipo', 'type', 'call_put', 'c/p', 'cp', 'natureza',
 }
+
+
+def _normalize_colname(name: str) -> str:
+    """Normalize CSV headers across locale/punctuation variants."""
+    text = str(name).strip().lower()
+    text = unicodedata.normalize('NFKD', text)
+    text = ''.join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r'[^a-z0-9]+', '_', text)
+    return text.strip('_')
 
 
 # =====================================================================
@@ -82,6 +94,7 @@ class ProfitRTDClient:
         self._connected = False
         self._last_update = 0.0
         self._last_refresh = 0.0
+        self._use_polling = False
 
     # ---- lifecycle ----
 
@@ -113,9 +126,19 @@ class ProfitRTDClient:
             print("[RTD COM] pywin32 not installed — pip install pywin32")
             return False
         except Exception as e:
-            print(f"[RTD COM] Connection failed: {e}")
-            self._server = None
-            return False
+            print(f"[RTD COM] Callback method failed: {e}")
+            print("[RTD COM] Attempting simplified polling mode...")
+            try:
+                # Workaround: Try simpler connection without callback wrapper
+                self._server = win32com.client.Dispatch(PROFIT_RTD_PROGID)
+                self._connected = True
+                self._use_polling = True
+                print(f"[RTD COM] Connected to {PROFIT_RTD_PROGID} (polling mode)")
+                return True
+            except Exception as e2:
+                print(f"[RTD COM] Polling mode also failed: {e2}")
+                self._server = None
+                return False
 
     def disconnect(self):
         """Terminate the RTD server connection."""
@@ -149,34 +172,48 @@ class ProfitRTDClient:
 
     def subscribe_oi(self, tickers: list, suffix: str = PROFIT_RTD_SUFFIX):
         """Subscribe to OI (CAB) for a list of option tickers."""
+        self.subscribe_attributes(tickers=tickers, attributes=['CAB'], suffix=suffix)
+
+    def subscribe_attributes(self, tickers: list, attributes: list, suffix: str = PROFIT_RTD_SUFFIX):
+        """Subscribe to one or more RTD attributes for each ticker."""
         if not self._connected:
+            return
+        attrs = [str(a).strip().upper() for a in (attributes or []) if str(a).strip()]
+        if not attrs:
             return
         new_count = 0
         for ticker in tickers:
-            key = (ticker, "CAB")
-            if key in self._reverse:
-                continue  # already subscribed
-            self._next_id += 1
-            tid = self._next_id
-            topic_str = f"{ticker}_{suffix}"
-            try:
-                new_values = True
-                result = self._server.ConnectData(
-                    tid, [topic_str, "CAB"], new_values
-                )
-                self._topics[tid] = key
-                self._reverse[key] = tid
-                # ConnectData may return an initial value
-                if result is not None:
-                    try:
-                        self._values[key] = float(result)
-                    except (ValueError, TypeError):
-                        pass
-                new_count += 1
-            except Exception as e:
-                print(f"[RTD COM] Subscribe error {ticker}: {e}")
+            tk = str(ticker).strip().upper()
+            if not tk:
+                continue
+            for attr in attrs:
+                key = (tk, attr)
+                if key in self._reverse:
+                    continue  # already subscribed
+                self._next_id += 1
+                tid = self._next_id
+                topic_str = f"{tk}_{suffix}"
+                try:
+                    new_values = True
+                    result = self._server.ConnectData(
+                        tid, [topic_str, attr], new_values
+                    )
+                    self._topics[tid] = key
+                    self._reverse[key] = tid
+                    # ConnectData may return an initial value
+                    if result is not None:
+                        try:
+                            self._values[key] = float(result)
+                        except (ValueError, TypeError):
+                            pass
+                    new_count += 1
+                except Exception as e:
+                    print(f"[RTD COM] Subscribe error {tk}/{attr}: {e}")
+                    if _is_fatal_com_error(e):
+                        _disable_rtd_com("fatal COM exception during ConnectData")
+                        return
         if new_count > 0:
-            print(f"[RTD COM] Subscribed to {new_count} new OI topics "
+            print(f"[RTD COM] Subscribed to {new_count} new RTD topics "
                   f"(total: {len(self._topics)})")
 
     def refresh(self) -> dict:
@@ -213,6 +250,8 @@ class ProfitRTDClient:
             return updated
         except Exception as e:
             print(f"[RTD COM] Refresh error: {e}")
+            if _is_fatal_com_error(e):
+                _disable_rtd_com("fatal COM exception during RefreshData")
             return {}
 
     def get_all_oi(self) -> dict:
@@ -227,6 +266,31 @@ class ProfitRTDClient:
                 except (ValueError, TypeError):
                     pass
         return result
+
+    def get_snapshot(self, tickers: list, attributes: list) -> pd.DataFrame:
+        """Return current RTD snapshot for tickers/attributes as a DataFrame."""
+        attrs = [str(a).strip().upper() for a in (attributes or []) if str(a).strip()]
+        if not tickers or not attrs:
+            return pd.DataFrame()
+
+        rows = []
+        for tk in tickers:
+            ticker = str(tk).strip().upper()
+            if not ticker:
+                continue
+            row = {'ticker': ticker}
+            for attr in attrs:
+                key = (ticker, attr)
+                val = self._values.get(key, float('nan'))
+                try:
+                    row[attr.lower()] = float(val)
+                except (ValueError, TypeError):
+                    row[attr.lower()] = float('nan')
+            rows.append(row)
+
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows)
 
 
 class _RTDUpdateEvent:
@@ -252,11 +316,38 @@ class _RTDUpdateEvent:
 # ---- Module-level singleton ----
 
 _rtd_client: ProfitRTDClient = None
+_rtd_com_disabled = False
+
+
+def _is_fatal_com_error(exc: Exception) -> bool:
+    """Identify fatal RTD COM errors where continuing calls is unsafe."""
+    msg = str(exc).lower()
+    return (
+        "access violation" in msg
+        or "-2147418113" in msg
+        or "catastrophic failure" in msg
+    )
+
+
+def _disable_rtd_com(reason: str = ""):
+    """Disable RTD COM for the current process and force CSV fallback."""
+    global _rtd_com_disabled, _rtd_client
+    _rtd_com_disabled = True
+    if _rtd_client is not None:
+        try:
+            _rtd_client.disconnect()
+        except Exception:
+            pass
+        _rtd_client = None
+    if reason:
+        print(f"[RTD COM] Disabled for this run: {reason}")
 
 
 def _get_rtd_client() -> ProfitRTDClient:
     """Get or create the singleton RTD COM client."""
     global _rtd_client
+    if _rtd_com_disabled:
+        return None
     if _rtd_client is None:
         client = ProfitRTDClient()
         if client.connect():
@@ -301,7 +392,7 @@ def _read_csv_oi(filepath: str = None, spot: float = None,
     # --- Normalise column names ---
     col_map = {}
     for c in df.columns:
-        cl = c.lower().strip().replace(' ', '_')
+        cl = _normalize_colname(c)
         if cl in _TICKER_ALIASES:
             col_map[c] = 'ticker'
         elif cl in _OI_ALIASES:
@@ -337,7 +428,7 @@ def _read_csv_oi(filepath: str = None, spot: float = None,
             before = len(df)
             df = df[df['strike'].isin(keep)]
             print(f"[RTD CSV] Filtered to {len(keep)} strikes around spot "
-                  f"{spot:.2f} ({before} → {len(df)} rows)")
+                f"{spot:.2f} ({before} -> {len(df)} rows)")
 
     return df[['ticker', 'oi']]
 
@@ -397,6 +488,53 @@ def read_rtd_oi(filepath: str = None, spot: float = None,
     # --- Strategy 2: CSV fallback ---
     return _read_csv_oi(filepath=filepath, spot=spot,
                         strikes_around=strikes_around)
+
+
+def read_rtd_option_snapshot(tickers: list,
+                             attributes: list = None,
+                             wait_seconds: float = 1.0,
+                             refresh_rounds: int = 3) -> pd.DataFrame:
+    """
+    Read RTD snapshot for option tickers and attributes (e.g., ULT/PEX/CAB).
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ticker plus one column per requested attribute (lowercase).
+        Example: ticker, ult, pex, cab
+    """
+    if not tickers:
+        return pd.DataFrame()
+
+    attrs = [str(a).strip().upper() for a in (attributes or ['CAB']) if str(a).strip()]
+    if not attrs:
+        attrs = ['CAB']
+
+    client = _get_rtd_client()
+    if client is None:
+        # Graceful fallback: if only CAB requested, map CSV/COM OI reader output.
+        if attrs == ['CAB']:
+            oi_df = read_rtd_oi(tickers=tickers)
+            if oi_df is not None and not oi_df.empty:
+                out = oi_df.copy()
+                out = out.rename(columns={'oi': 'cab'})
+                if 'ticker' in out.columns:
+                    out['ticker'] = out['ticker'].astype(str).str.strip().str.upper()
+                return out[['ticker', 'cab']]
+        return pd.DataFrame()
+
+    try:
+        client.subscribe_attributes(tickers=tickers, attributes=attrs)
+        rounds = max(int(refresh_rounds), 1)
+        per_round_wait = max(float(wait_seconds), 0.0) / float(rounds)
+        for i in range(rounds):
+            client.refresh()
+            if per_round_wait > 0 and i < rounds - 1:
+                time.sleep(per_round_wait)
+        return client.get_snapshot(tickers=tickers, attributes=attrs)
+    except Exception as e:
+        print(f"[RTD COM] Snapshot error: {e}")
+        return pd.DataFrame()
 
 
 def rtd_data_changed() -> bool:
