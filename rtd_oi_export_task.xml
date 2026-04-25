@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  Task Scheduler template: run the RTD OI exporter every 5 minutes during
+  B3 trading hours (10:00-17:30 BRT, Mon-Fri).
+
+  Import with:
+    schtasks /Create /TN "GEX\RTD_OI_Export" /XML rtd_oi_export_task.xml /F
+
+  Before importing:
+    1. Replace REPLACE_USER with the interactive Windows account (e.g. PC\degod).
+    2. Adjust StartBoundary timezone if not running under BRT (UTC-3).
+    3. Confirm WorkbookPath argument matches your generated workbook.
+    4. The task MUST be set to "Run only when user is logged on" (this XML
+       already enforces it via LogonType=InteractiveToken). Profit Pro and
+       Excel RTD do not deliver values under Session 0 (Run whether user is
+       logged on or not).
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>GEX Analytics</Author>
+    <Description>Export Profit Pro RTD OI from Excel workbook to MQL5\Files\RTD_OI.csv every 5 minutes during B3 hours.</Description>
+    <URI>\GEX\RTD_OI_Export</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-04-25T10:00:00</StartBoundary>
+      <EndBoundary>2099-12-31T17:30:00</EndBoundary>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <Duration>PT7H30M</Duration>
+        <StopAtDurationEnd>true</StopAtDurationEnd>
+      </Repetition>
+      <ScheduleByWeek>
+        <DaysOfWeek>
+          <Monday />
+          <Tuesday />
+          <Wednesday />
+          <Thursday />
+          <Friday />
+        </DaysOfWeek>
+        <WeeksInterval>1</WeeksInterval>
+      </ScheduleByWeek>
+      <Enabled>true</Enabled>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>REPLACE_USER</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT4M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>cmd.exe</Command>
+      <Arguments>/c "%USERPROFILE%\AppData\Roaming\MetaQuotes\Terminal\6C3C6A11D1C3791DD4DBF45421BF8028\MQL5\Scripts\GEX_Analytics_options_futures\export_rtd_oi_from_excel.bat" "%USERPROFILE%\AppData\Roaming\MetaQuotes\Terminal\6C3C6A11D1C3791DD4DBF45421BF8028\MQL5\Scripts\GEX_Analytics_options_futures\RTD_OI_BOVA11_from_B3.xlsx" RTD_OI 10</Arguments>
+      <WorkingDirectory>%USERPROFILE%\AppData\Roaming\MetaQuotes\Terminal\6C3C6A11D1C3791DD4DBF45421BF8028\MQL5\Scripts\GEX_Analytics_options_futures</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

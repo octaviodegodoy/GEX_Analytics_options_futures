@@ -369,12 +369,50 @@ def rtd_shutdown():
 #  CSV Fallback Reader
 # =====================================================================
 
+#: Maximum age (seconds) for the RTD CSV to be considered current-day data.
+#: RTD readings are only valid for the current trading day; a stale file from a
+#: previous session must not silently feed the GEX calculation.
+RTD_CSV_MAX_AGE_SECONDS = 30 * 60  # 30 minutes
+
+
+def _is_csv_fresh(path: str, max_age_seconds: int = RTD_CSV_MAX_AGE_SECONDS) -> bool:
+    """Return True if the CSV mtime is from today and within max_age_seconds."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return False
+    import datetime as _dt
+    now = time.time()
+    age = now - mtime
+    today = _dt.date.today()
+    file_date = _dt.date.fromtimestamp(mtime)
+    if file_date != today:
+        print(f"[RTD CSV] Rejecting stale file: mtime date {file_date} != today {today} "
+              f"({path})")
+        return False
+    if age > max_age_seconds:
+        print(f"[RTD CSV] Rejecting stale file: age {age:.0f}s > "
+              f"max {max_age_seconds}s ({path})")
+        return False
+    return True
+
+
 def _read_csv_oi(filepath: str = None, spot: float = None,
-                 strikes_around: int = 15) -> pd.DataFrame:
-    """Read OI from a Profit Pro CSV export (fallback when COM unavailable)."""
+                 strikes_around: int = 15,
+                 enforce_freshness: bool = True,
+                 max_age_seconds: int = RTD_CSV_MAX_AGE_SECONDS) -> pd.DataFrame:
+    """Read OI from a Profit Pro CSV export (fallback when COM unavailable).
+
+    By default, files older than ``max_age_seconds`` or dated before today are
+    rejected to prevent stale OI from a previous session leaking into the GEX
+    parameters. Pass ``enforce_freshness=False`` for backtest/inspection only.
+    """
     path = filepath or RTD_OI_PATH
 
     if not os.path.exists(path):
+        return pd.DataFrame()
+
+    if enforce_freshness and not _is_csv_fresh(path, max_age_seconds=max_age_seconds):
         return pd.DataFrame()
 
     df = None
@@ -439,7 +477,9 @@ def _read_csv_oi(filepath: str = None, spot: float = None,
 
 def read_rtd_oi(filepath: str = None, spot: float = None,
                 strikes_around: int = 15,
-                tickers: list = None) -> pd.DataFrame:
+                tickers: list = None,
+                enforce_freshness: bool = True,
+                max_age_seconds: int = RTD_CSV_MAX_AGE_SECONDS) -> pd.DataFrame:
     """
     Get real-time OI data from Profit Pro.
 
@@ -458,6 +498,11 @@ def read_rtd_oi(filepath: str = None, spot: float = None,
     tickers : list of str, optional
         Option ticker codes (e.g. ['BOVAT196', 'BOVAP196']).
         When provided, enables direct COM RTD connection to Profit Pro.
+    enforce_freshness : bool
+        Reject CSV files dated before today or older than ``max_age_seconds``.
+        RTD data is only valid for the current trading day.
+    max_age_seconds : int
+        Maximum CSV file age accepted when ``enforce_freshness`` is True.
 
     Returns
     -------
@@ -480,7 +525,9 @@ def read_rtd_oi(filepath: str = None, spot: float = None,
                     if not df.empty:
                         print(f"[RTD COM] Live OI: {len(df)} options with OI > 0")
                         return df
-                print("[RTD COM] No OI values yet (server warming up?) "
+                print("[RTD COM] No OI values yet (se,
+                        enforce_freshness=enforce_freshness,
+                        max_age_seconds=max_age_secondsrver warming up?) "
                       "— trying CSV fallback")
             except Exception as e:
                 print(f"[RTD COM] Error: {e} — trying CSV fallback")
