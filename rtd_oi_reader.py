@@ -525,16 +525,16 @@ def read_rtd_oi(filepath: str = None, spot: float = None,
                     if not df.empty:
                         print(f"[RTD COM] Live OI: {len(df)} options with OI > 0")
                         return df
-                print("[RTD COM] No OI values yet (se,
-                        enforce_freshness=enforce_freshness,
-                        max_age_seconds=max_age_secondsrver warming up?) "
+                print("[RTD COM] No OI values yet (server warming up?) "
                       "— trying CSV fallback")
             except Exception as e:
                 print(f"[RTD COM] Error: {e} — trying CSV fallback")
 
     # --- Strategy 2: CSV fallback ---
     return _read_csv_oi(filepath=filepath, spot=spot,
-                        strikes_around=strikes_around)
+                        strikes_around=strikes_around,
+                        enforce_freshness=enforce_freshness,
+                        max_age_seconds=max_age_seconds)
 
 
 def read_rtd_option_snapshot(tickers: list,
