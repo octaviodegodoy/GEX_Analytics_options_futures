@@ -336,17 +336,20 @@ def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
         result['debug']['dist_to_put_wall_pct'] = float(dist_to_pw) if np.isfinite(dist_to_pw) else np.nan
 
         # Use nearest support zone for proximity when available
+        # in_zone uses a symmetric bracket of width abs_proximity around the
+        # reference: spot must actually approach the support/put-wall, not
+        # merely sit anywhere on the favorable side of an offset threshold.
         if np.isfinite(nearest_support) and put_wall != 0:
-            # buy_offset < 0 → entry zone below support; > 0 → above support
-            entry_zone = nearest_support * (1.0 + buy_offset)
-            in_zone = spot <= entry_zone if buy_offset >= 0 else spot >= entry_zone
-            support_label = f'support zone ({nearest_support:.2f}, entry {entry_zone:.2f})'
-            result['debug']['reference_price'] = float(nearest_support)
+            ref_price = nearest_support
+            entry_zone = ref_price * (1.0 + buy_offset)
+            support_label = f'support zone ({ref_price:.2f}, entry {entry_zone:.2f})'
+            result['debug']['reference_price'] = float(ref_price)
         else:
-            entry_zone = put_wall * (1.0 + buy_offset)
-            in_zone = spot <= entry_zone if buy_offset >= 0 else spot >= entry_zone
-            support_label = f'put wall ({put_wall:.2f}, entry {entry_zone:.2f})'
-            result['debug']['reference_price'] = float(put_wall) if np.isfinite(put_wall) else np.nan
+            ref_price = put_wall
+            entry_zone = ref_price * (1.0 + buy_offset)
+            support_label = f'put wall ({ref_price:.2f}, entry {entry_zone:.2f})'
+            result['debug']['reference_price'] = float(ref_price) if np.isfinite(ref_price) else np.nan
+        in_zone = abs(spot - ref_price) <= abs_proximity * abs(ref_price)
 
         result['debug']['entry_zone'] = float(entry_zone) if np.isfinite(entry_zone) else np.nan
         if buy_offset >= 0:
@@ -392,17 +395,19 @@ def generate_gex_trade_signals(spot, gamma_flip, call_wall, put_wall,
         result['debug']['dist_to_call_wall_pct'] = float(dist_to_cw) if np.isfinite(dist_to_cw) else np.nan
 
         # Use nearest resistance zone for proximity when available
+        # in_zone uses a symmetric bracket of width abs_proximity around the
+        # reference: spot must actually approach the resistance/call-wall.
         if np.isfinite(nearest_resist) and call_wall != 0:
-            # sell_offset > 0 → entry zone above resistance; < 0 → below resistance
-            entry_zone = nearest_resist * (1.0 + sell_offset)
-            in_zone = spot >= entry_zone if sell_offset >= 0 else spot <= entry_zone
-            resist_label = f'resistance zone ({nearest_resist:.2f}, entry {entry_zone:.2f})'
-            result['debug']['reference_price'] = float(nearest_resist)
+            ref_price = nearest_resist
+            entry_zone = ref_price * (1.0 + sell_offset)
+            resist_label = f'resistance zone ({ref_price:.2f}, entry {entry_zone:.2f})'
+            result['debug']['reference_price'] = float(ref_price)
         else:
-            entry_zone = call_wall * (1.0 + sell_offset)
-            in_zone = spot >= entry_zone if sell_offset >= 0 else spot <= entry_zone
-            resist_label = f'call wall ({call_wall:.2f}, entry {entry_zone:.2f})'
-            result['debug']['reference_price'] = float(call_wall) if np.isfinite(call_wall) else np.nan
+            ref_price = call_wall
+            entry_zone = ref_price * (1.0 + sell_offset)
+            resist_label = f'call wall ({ref_price:.2f}, entry {entry_zone:.2f})'
+            result['debug']['reference_price'] = float(ref_price) if np.isfinite(ref_price) else np.nan
+        in_zone = abs(spot - ref_price) <= abs_proximity * abs(ref_price)
 
         result['debug']['entry_zone'] = float(entry_zone) if np.isfinite(entry_zone) else np.nan
         if sell_offset >= 0:

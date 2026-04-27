@@ -432,6 +432,61 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
             _in_trade_window = GEX_TRADE_WINDOW_START <= _now_hm <= GEX_TRADE_WINDOW_END
             _daily_loss_ok = _daily_realized_pnl > -_daily_loss_limit
 
+            # --- End-of-window: force-close all GEX positions and stop monitor ---
+            if _now_hm > GEX_TRADE_WINDOW_END:
+                _eow_positions = _mt5.positions_get(symbol=win_symbol) or []
+                _eow_gex = [p for p in _eow_positions if p.magic == GEX_MAGIC_NUMBER]
+                if _eow_gex:
+                    ts_eow = _dt.now().strftime("%H:%M:%S")
+                    print(f"\n[{ts_eow}] [EOW] Trade window ended ({GEX_TRADE_WINDOW_END}) — "
+                          f"closing {len(_eow_gex)} GEX position(s) on {win_symbol}")
+                    _eow_tick = _mt5.symbol_info_tick(win_symbol)
+                    _eow_info = _mt5.symbol_info(win_symbol)
+                    _eow_filling = _mt5.ORDER_FILLING_IOC
+                    if _eow_info is not None:
+                        _ft = _eow_info.filling_mode
+                        if _ft & 1:
+                            _eow_filling = _mt5.ORDER_FILLING_FOK
+                        elif _ft & 2:
+                            _eow_filling = _mt5.ORDER_FILLING_IOC
+                        elif _ft & 4:
+                            _eow_filling = _mt5.ORDER_FILLING_RETURN
+                    for _ep in _eow_gex:
+                        if _ep.type == _mt5.POSITION_TYPE_BUY:
+                            _close_type = _mt5.ORDER_TYPE_SELL
+                            _close_price = _eow_tick.bid if _eow_tick else _ep.price_current
+                        else:
+                            _close_type = _mt5.ORDER_TYPE_BUY
+                            _close_price = _eow_tick.ask if _eow_tick else _ep.price_current
+                        _close_req = {
+                            "action": _mt5.TRADE_ACTION_DEAL,
+                            "symbol": win_symbol,
+                            "volume": _ep.volume,
+                            "type": _close_type,
+                            "position": _ep.ticket,
+                            "price": _close_price,
+                            "deviation": GEX_ORDER_DEVIATION,
+                            "magic": GEX_MAGIC_NUMBER,
+                            "comment": "GEX EOW close",
+                            "type_time": _mt5.ORDER_TIME_GTC,
+                            "type_filling": _eow_filling,
+                        }
+                        _close_res = _mt5.order_send(_close_req)
+                        if _close_res is not None and _close_res.retcode == _mt5.TRADE_RETCODE_DONE:
+                            print(f"[{ts_eow}] [EOW] Closed #{_ep.ticket} "
+                                  f"({'BUY' if _ep.type == _mt5.POSITION_TYPE_BUY else 'SELL'} "
+                                  f"{_ep.volume:.0f} @ {_close_price:.0f})")
+                        else:
+                            _rc = getattr(_close_res, 'retcode', None) if _close_res is not None else None
+                            _cm = getattr(_close_res, 'comment', '') if _close_res is not None else _mt5.last_error()
+                            print(f"[{ts_eow}] [EOW] Close FAILED #{_ep.ticket} "
+                                  f"(retcode={_rc}, {_cm})")
+                else:
+                    ts_eow = _dt.now().strftime("%H:%M:%S")
+                    print(f"\n[{ts_eow}] [EOW] Trade window ended ({GEX_TRADE_WINDOW_END}) — "
+                          f"no open GEX positions, stopping monitor.")
+                break
+
             # --- Execute BUY ---
             _fib = [1, 1, 2, 3, 5, 8, 13, 21]
             _fib_total = 1 + sum(_fib[:GEX_DCA_MAX_ORDERS])

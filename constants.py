@@ -20,7 +20,7 @@ GEX_MONITOR_ENABLED = True       # Set to True to start real-time GEX monitor af
 GEX_RTD_REFRESH_INTERVAL = 300   # Re-read RTD OI file every N seconds (0 = disabled)
 
 # --- Confirmation & Setup Filters (Fixed across all modes) ---
-GEX_REQUIRE_5M_CONFIRMATION = False  # Require 5-minute directional confirmation before entry
+GEX_REQUIRE_5M_CONFIRMATION = True  # Require 5-minute directional confirmation before entry
 GEX_CONFIRMATION_MINUTES = 5        # Confirmation window in minutes
 GEX_NEUTRAL_ONLY = False            # Only enter in neutral setup (between walls and near gamma flip)
 GEX_NEUTRAL_MAX_FLIP_DISTANCE_PCT = 0.005  # Max distance to flip for neutral setup (0.5%)
