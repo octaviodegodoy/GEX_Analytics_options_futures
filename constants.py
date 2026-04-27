@@ -10,7 +10,7 @@ PLOT_GEX = False  # Set to False to skip all GEX chart generation
 
 # --- TRADING MODE SELECTOR ---
 # Choose "CONSERVATIVE" for low-risk defaults, "MODERATE" for balanced risk
-TRADING_MODE = "MODERATE"
+TRADING_MODE = "CONSERVATIVE"
 
 # --- GEX Order & Monitor Settings (Base) ---
 GEX_SEND_ORDERS = True            # Set to True to enable order execution
@@ -39,7 +39,7 @@ _PROFILE_CONSERVATIVE = {
 # --- PROFILE: MODERATE (Balanced risk, standard sizing) ---
 _PROFILE_MODERATE = {
     'order_volume': 1.0,            # Standard initial size
-    'margin_free_pct': 0.15,        # Use 15% of free margin as total budget
+    'margin_free_pct': 0.05,        # Use 15% of free margin as total budget
     'sl_risk_pct': 0.40,            # Stop loss as 40% of margin
     'dca_max_orders': 3,            # Up to 3 DCA additions (total = initial + 3)
     'min_signal_strength': 2,       # Require full signal strength

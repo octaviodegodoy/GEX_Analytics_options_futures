@@ -45,6 +45,7 @@ from kalman_price_mapper import (
     build_ind_bova11_mapper,
     build_ind_bova11_mapper_intraday,
 )
+from mt5_connector import sanitize_modify_sl
 
 
 async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
@@ -659,22 +660,28 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                             should_update = True
 
                         if should_update:
+                            safe_sl = sanitize_modify_sl(
+                                win_symbol, is_buy, new_sl, current_sl=current_sl,
+                            )
+                            if safe_sl <= 0.0:
+                                continue  # broker would reject; skip this tick
                             modify_req = {
                                 "action": _mt5.TRADE_ACTION_SLTP,
                                 "symbol": win_symbol,
                                 "position": sp.ticket,
-                                "sl": new_sl,
+                                "sl": safe_sl,
                                 "tp": sp.tp,
                             }
                             mod_result = _mt5.order_send(modify_req)
                             ts_now = _dt.now().strftime("%H:%M:%S")
                             if mod_result and mod_result.retcode == _mt5.TRADE_RETCODE_DONE:
                                 print(f"[{ts_now}] [Trailing] {side_key} #{sp.ticket} SL → "
-                                      f"{new_sl:.0f} (best {trail['best']:.0f}, "
+                                      f"{safe_sl:.0f} (best {trail['best']:.0f}, "
                                       f"profit R${profit_r:,.2f})")
                             else:
                                 err = mod_result.comment if mod_result else _mt5.last_error()
-                                print(f"[{ts_now}] [Trailing] SL update #{sp.ticket} failed: {err}")
+                                print(f"[{ts_now}] [Trailing] SL update #{sp.ticket} failed: {err} "
+                                      f"(tried {safe_sl:.0f})")
 
                     trail['sl_price'] = new_sl
 
@@ -795,19 +802,25 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                             elif not is_buy and (current_sp_sl == 0.0 or new_sl != current_sp_sl):
                                 should_update = True
                             if should_update:
+                                safe_sl = sanitize_modify_sl(
+                                    win_symbol, is_buy, new_sl, current_sl=current_sp_sl,
+                                )
+                                if safe_sl <= 0.0:
+                                    continue
                                 modify_req = {
                                     "action": _mt5.TRADE_ACTION_SLTP,
                                     "symbol": win_symbol,
                                     "position": sp.ticket,
-                                    "sl": new_sl,
+                                    "sl": safe_sl,
                                     "tp": sp.tp,
                                 }
                                 mod_result = _mt5.order_send(modify_req)
                                 if mod_result and mod_result.retcode == _mt5.TRADE_RETCODE_DONE:
-                                    print(f"[{ts_now}] [DCA] SL synced #{sp.ticket} → {new_sl:.0f}")
+                                    print(f"[{ts_now}] [DCA] SL synced #{sp.ticket} → {safe_sl:.0f}")
                                 else:
                                     err = mod_result.comment if mod_result else _mt5.last_error()
-                                    print(f"[{ts_now}] [DCA] SL sync #{sp.ticket} failed: {err}")
+                                    print(f"[{ts_now}] [DCA] SL sync #{sp.ticket} failed: {err} "
+                                          f"(tried {safe_sl:.0f})")
 
                         pnl_per_pt = total_vol * (tk_val / tk_sz)
                         if is_buy:

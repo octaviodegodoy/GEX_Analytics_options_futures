@@ -161,6 +161,56 @@ def _sanitize_pending_stops(symbol_info, market_type, ref_price, sl, tp):
     return sl, tp
 
 
+def sanitize_modify_sl(symbol, is_buy, desired_sl, current_sl=0.0):
+    """Clamp a desired SL so a TRADE_ACTION_SLTP modify won't return INVALID_STOPS.
+
+    Rules enforced:
+      - SL must be on the correct side of bid/ask for the position type.
+      - SL must be at least ``trade_stops_level`` (or freeze level) points
+        away from the current price.
+      - SL must be aligned to ``trade_tick_size``.
+      - For BUY: trailing SL only moves UP (returns ``current_sl`` if the
+        clamped value would be lower).
+      - For SELL: trailing SL only moves DOWN.
+      - Returns 0.0 if no safe SL can be placed (caller should skip the modify).
+    """
+    desired = float(desired_sl or 0.0)
+    if desired <= 0.0:
+        return 0.0
+
+    symbol_info = mt5.symbol_info(symbol)
+    tick = mt5.symbol_info_tick(symbol)
+    if symbol_info is None or tick is None or tick.bid <= 0 or tick.ask <= 0:
+        return desired  # can't validate; let server decide
+
+    point = symbol_info.point or 0.0
+    tick_size = symbol_info.trade_tick_size or point or 0.0
+    digits = symbol_info.digits
+    stops_level = max(
+        getattr(symbol_info, "trade_stops_level", 0) or 0,
+        getattr(symbol_info, "trade_freeze_level", 0) or 0,
+    )
+    min_dist = stops_level * point
+    cur = float(current_sl or 0.0)
+
+    if is_buy:
+        max_sl = tick.bid - min_dist
+        if max_sl <= 0:
+            return 0.0
+        sl = min(desired, max_sl)
+        sl = _normalize_to_tick(sl, tick_size, digits)
+        if cur > 0 and sl <= cur:  # never loosen a BUY trailing stop
+            return 0.0
+        return sl
+    else:
+        min_sl = tick.ask + min_dist
+        sl = max(desired, min_sl)
+        sl = _normalize_to_tick(sl, tick_size, digits)
+        if cur > 0 and sl >= cur:  # never loosen a SELL trailing stop
+            return 0.0
+        return sl
+
+
 class MT5Connector:
 
     ORDER_TYPE_BUY = mt5.ORDER_TYPE_BUY
