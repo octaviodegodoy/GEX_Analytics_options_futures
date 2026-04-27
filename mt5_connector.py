@@ -8,6 +8,159 @@ import pandas as pd
 from constants import CALL_OPTION, MAGIC_NUMBER, MIN_DAYS_TO_EXPIRY, PERIODS, SHIFT_PERIODS
 from constants import GEX_MAGIC_NUMBER
 
+
+def _normalize_to_tick(price: float, tick_size: float, digits: int) -> float:
+    if tick_size and tick_size > 0:
+        return round(round(price / tick_size) * tick_size, digits)
+    return round(price, digits)
+
+
+def _sanitize_stops(symbol, symbol_info, order_type, sl, tp):
+    """Adjust SL/TP so the broker accepts them.
+
+    TRADE_RETCODE_INVALID_STOPS (10016) fires when SL/TP are:
+      - on the wrong side of the current bid/ask for the order direction, or
+      - closer than ``trade_stops_level`` (or ``trade_freeze_level``) points
+        from the current price, or
+      - not aligned to ``trade_tick_size``.
+
+    Strategy: drop a stop that's on the wrong side (set to 0); push a
+    same-side but too-close stop to the minimum allowed distance. Always
+    normalize to tick size.
+    """
+    sl = float(sl or 0.0)
+    tp = float(tp or 0.0)
+    if sl == 0.0 and tp == 0.0:
+        return 0.0, 0.0
+
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None or tick.bid <= 0 or tick.ask <= 0:
+        return sl, tp  # can't validate without a quote; let server decide
+
+    point = symbol_info.point or 0.0
+    tick_size = symbol_info.trade_tick_size or point or 0.0
+    digits = symbol_info.digits
+
+    stops_level = max(
+        getattr(symbol_info, "trade_stops_level", 0) or 0,
+        getattr(symbol_info, "trade_freeze_level", 0) or 0,
+    )
+    min_dist = stops_level * point  # distance in price units
+
+    is_buy = order_type == mt5.ORDER_TYPE_BUY
+    bid = tick.bid
+    ask = tick.ask
+
+    # --- Stop loss --------------------------------------------------------
+    if sl > 0.0:
+        if is_buy:
+            max_sl = bid - min_dist
+            if sl >= bid:           # wrong side
+                print(f"[STOPS] {symbol}: SL {sl:.{digits}f} >= bid {bid:.{digits}f} (wrong side) — dropped")
+                sl = 0.0
+            elif sl > max_sl:        # too close
+                new_sl = _normalize_to_tick(max_sl, tick_size, digits)
+                print(f"[STOPS] {symbol}: SL {sl:.{digits}f} too close (min dist {min_dist}); pushed to {new_sl:.{digits}f}")
+                sl = new_sl
+            else:
+                sl = _normalize_to_tick(sl, tick_size, digits)
+        else:  # SELL
+            min_sl = ask + min_dist
+            if sl <= ask:
+                print(f"[STOPS] {symbol}: SL {sl:.{digits}f} <= ask {ask:.{digits}f} (wrong side) — dropped")
+                sl = 0.0
+            elif sl < min_sl:
+                new_sl = _normalize_to_tick(min_sl, tick_size, digits)
+                print(f"[STOPS] {symbol}: SL {sl:.{digits}f} too close (min dist {min_dist}); pushed to {new_sl:.{digits}f}")
+                sl = new_sl
+            else:
+                sl = _normalize_to_tick(sl, tick_size, digits)
+
+    # --- Take profit ------------------------------------------------------
+    if tp > 0.0:
+        if is_buy:
+            min_tp = ask + min_dist
+            if tp <= ask:
+                print(f"[STOPS] {symbol}: TP {tp:.{digits}f} <= ask {ask:.{digits}f} (wrong side) — dropped")
+                tp = 0.0
+            elif tp < min_tp:
+                new_tp = _normalize_to_tick(min_tp, tick_size, digits)
+                print(f"[STOPS] {symbol}: TP {tp:.{digits}f} too close (min dist {min_dist}); pushed to {new_tp:.{digits}f}")
+                tp = new_tp
+            else:
+                tp = _normalize_to_tick(tp, tick_size, digits)
+        else:  # SELL
+            max_tp = bid - min_dist
+            if tp >= bid:
+                print(f"[STOPS] {symbol}: TP {tp:.{digits}f} >= bid {bid:.{digits}f} (wrong side) — dropped")
+                tp = 0.0
+            elif tp > max_tp:
+                new_tp = _normalize_to_tick(max_tp, tick_size, digits)
+                print(f"[STOPS] {symbol}: TP {tp:.{digits}f} too close (min dist {min_dist}); pushed to {new_tp:.{digits}f}")
+                tp = new_tp
+            else:
+                tp = _normalize_to_tick(tp, tick_size, digits)
+
+    return sl, tp
+
+
+def _sanitize_pending_stops(symbol_info, market_type, ref_price, sl, tp):
+    """Same idea as _sanitize_stops, but for pending orders the reference
+    price is the order's own limit price (not bid/ask)."""
+    sl = float(sl or 0.0)
+    tp = float(tp or 0.0)
+    if sl == 0.0 and tp == 0.0:
+        return 0.0, 0.0
+
+    point = symbol_info.point or 0.0
+    tick_size = symbol_info.trade_tick_size or point or 0.0
+    digits = symbol_info.digits
+    stops_level = max(
+        getattr(symbol_info, "trade_stops_level", 0) or 0,
+        getattr(symbol_info, "trade_freeze_level", 0) or 0,
+    )
+    min_dist = stops_level * point
+    is_buy = market_type == mt5.ORDER_TYPE_BUY
+
+    if sl > 0.0:
+        if is_buy:
+            limit = ref_price - min_dist
+            if sl >= ref_price:
+                sl = 0.0
+            elif sl > limit:
+                sl = _normalize_to_tick(limit, tick_size, digits)
+            else:
+                sl = _normalize_to_tick(sl, tick_size, digits)
+        else:
+            limit = ref_price + min_dist
+            if sl <= ref_price:
+                sl = 0.0
+            elif sl < limit:
+                sl = _normalize_to_tick(limit, tick_size, digits)
+            else:
+                sl = _normalize_to_tick(sl, tick_size, digits)
+
+    if tp > 0.0:
+        if is_buy:
+            limit = ref_price + min_dist
+            if tp <= ref_price:
+                tp = 0.0
+            elif tp < limit:
+                tp = _normalize_to_tick(limit, tick_size, digits)
+            else:
+                tp = _normalize_to_tick(tp, tick_size, digits)
+        else:
+            limit = ref_price - min_dist
+            if tp >= ref_price:
+                tp = 0.0
+            elif tp > limit:
+                tp = _normalize_to_tick(limit, tick_size, digits)
+            else:
+                tp = _normalize_to_tick(tp, tick_size, digits)
+
+    return sl, tp
+
+
 class MT5Connector:
 
     ORDER_TYPE_BUY = mt5.ORDER_TYPE_BUY
@@ -40,7 +193,10 @@ class MT5Connector:
         if symbol_info is None:
             print(f"Symbol {symbol} not found")
             return
-        
+
+        # --- Sanitize SL/TP to avoid TRADE_RETCODE_INVALID_STOPS (10016) ---
+        sl, tp = _sanitize_stops(symbol, symbol_info, order_type, sl, tp)
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
@@ -55,7 +211,7 @@ class MT5Connector:
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
-        
+
         result = mt5.order_send(request)
 
         if result is None:
@@ -64,6 +220,19 @@ class MT5Connector:
             print(f"Order send result: retcode={result.retcode}, comment={result.comment}")
             if result.retcode == mt5.TRADE_RETCODE_DONE:
                 print(f"Order executed successfully! Order: {result.order}, Deal: {result.deal}")
+            elif result.retcode == mt5.TRADE_RETCODE_INVALID_STOPS and (sl or tp):
+                # Last-resort retry without SL/TP so the position at least opens;
+                # the trailing/monitor loop will set a stop on the next tick.
+                print(f"Order failed: {result.comment} — retrying without SL/TP")
+                request["sl"] = 0.0
+                request["tp"] = 0.0
+                result = mt5.order_send(request)
+                if result is None:
+                    print(f"Retry failed, error: {mt5.last_error()}")
+                elif result.retcode == mt5.TRADE_RETCODE_DONE:
+                    print(f"Order executed (no SL/TP) Order: {result.order}, Deal: {result.deal}")
+                else:
+                    print(f"Retry failed: {result.comment} (retcode={result.retcode})")
             else:
                 print(f"Order failed: {result.comment}")
 
@@ -130,6 +299,11 @@ class MT5Connector:
         tick_size = symbol_info.trade_tick_size
         if tick_size > 0:
             price = round(round(price / tick_size) * tick_size, symbol_info.digits)
+
+        # Sanitize SL/TP using the limit price as the reference. Pending-order
+        # validation uses the same stops_level distance from the order price.
+        market_type = mt5.ORDER_TYPE_BUY if order_type == mt5.ORDER_TYPE_BUY_LIMIT else mt5.ORDER_TYPE_SELL
+        sl, tp = _sanitize_pending_stops(symbol_info, market_type, price, sl, tp)
 
         # Determine filling mode
         filling = symbol_info.filling_mode

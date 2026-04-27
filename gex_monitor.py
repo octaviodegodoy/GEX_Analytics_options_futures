@@ -130,6 +130,12 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
     buy_executed  = False
     sell_executed = False
 
+    # Per-side cooldown after a failed order_send so we don't hammer the
+    # broker every tick when the signal stays up. Reset to 0 on success.
+    _buy_retry_after  = 0.0  # epoch seconds; new BUY allowed when time.time() >= this
+    _sell_retry_after = 0.0
+    _ORDER_RETRY_COOLDOWN = 30  # seconds between failed-send retries
+
     # Trailing stop state per side
     trail_buy  = None
     trail_sell = None
@@ -432,7 +438,8 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
             if (sig == 'BUY' and strength >= GEX_MIN_SIGNAL_STRENGTH
                     and not buy_executed and np.isfinite(win_entry_buy)
                     and _in_trade_window and _daily_loss_ok
-                    and buy_confirm_ok and neutral_ok):
+                    and buy_confirm_ok and neutral_ok
+                    and _time.time() >= _buy_retry_after):
                 _live = _mt5.positions_get(symbol=win_symbol)
                 if any(p.magic == GEX_MAGIC_NUMBER and p.type == _mt5.POSITION_TYPE_BUY
                        for p in (_live or [])):
@@ -474,6 +481,7 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                     _entry_budget = margin_budget
                     if result is not None and hasattr(result, 'retcode') and result.retcode == _mt5.TRADE_RETCODE_DONE:
                         buy_executed = True
+                        _buy_retry_after = 0.0
                         trail_buy = {
                             'entry': tick.ask, 'vol': vol,
                             'best': tick.ask, 'active': False,
@@ -495,23 +503,22 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                                   f"(R${_dca1_step:,.2f} loss, {GEX_DCA_LOSS_STEP_PCT:.0%} of budget)")
                         print()
                     else:
-                        print(f"[GEX Monitor] BUY order sent (check logs above for status)")
-                        buy_executed = True
-                        trail_buy = {
-                            'entry': tick.ask, 'vol': vol,
-                            'best': tick.ask, 'active': False,
-                            'tick_sz': tick_sz, 'tick_val': tick_val,
-                            'sl_points': sl_points, 'sl_price': sl_price,
-                            'dca_count': 0, 'wall': 'PutWall',
-                            'margin_budget': _entry_budget,
-                        }
+                        # Order did NOT fill. Do NOT mark buy_executed so the
+                        # next tick can retry while the BUY signal is still up.
+                        # Apply a short cooldown to avoid spamming the broker.
+                        _rc = getattr(result, 'retcode', None) if result is not None else None
+                        _cm = getattr(result, 'comment', '') if result is not None else _mt5.last_error()
+                        _buy_retry_after = _time.time() + _ORDER_RETRY_COOLDOWN
+                        print(f"[GEX Monitor] BUY order FAILED (retcode={_rc}, {_cm}) — "
+                              f"will retry in {_ORDER_RETRY_COOLDOWN}s if signal persists")
                         print()
 
             # --- Execute SELL ---
             elif (sig == 'SELL' and strength >= GEX_MIN_SIGNAL_STRENGTH
                       and not sell_executed and np.isfinite(win_entry_sell)
                       and _in_trade_window and _daily_loss_ok
-                      and sell_confirm_ok and neutral_ok):
+                      and sell_confirm_ok and neutral_ok
+                      and _time.time() >= _sell_retry_after):
                 _live = _mt5.positions_get(symbol=win_symbol)
                 if any(p.magic == GEX_MAGIC_NUMBER and p.type == _mt5.POSITION_TYPE_SELL
                        for p in (_live or [])):
@@ -553,6 +560,7 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                     _entry_budget = margin_budget
                     if result is not None and hasattr(result, 'retcode') and result.retcode == _mt5.TRADE_RETCODE_DONE:
                         sell_executed = True
+                        _sell_retry_after = 0.0
                         trail_sell = {
                             'entry': tick.bid, 'vol': vol,
                             'best': tick.bid, 'active': False,
@@ -574,16 +582,13 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                                   f"(R${_dca1_step:,.2f} loss, {GEX_DCA_LOSS_STEP_PCT:.0%} of budget)")
                         print()
                     else:
-                        print(f"[GEX Monitor] SELL order sent (check logs above for status)")
-                        sell_executed = True
-                        trail_sell = {
-                            'entry': tick.bid, 'vol': vol,
-                            'best': tick.bid, 'active': False,
-                            'tick_sz': tick_sz, 'tick_val': tick_val,
-                            'sl_points': sl_points, 'sl_price': sl_price,
-                            'dca_count': 0, 'wall': 'CallWall',
-                            'margin_budget': _entry_budget,
-                        }
+                        # Order did NOT fill. Keep sell_executed False so the
+                        # next tick retries while the SELL signal is still up.
+                        _rc = getattr(result, 'retcode', None) if result is not None else None
+                        _cm = getattr(result, 'comment', '') if result is not None else _mt5.last_error()
+                        _sell_retry_after = _time.time() + _ORDER_RETRY_COOLDOWN
+                        print(f"[GEX Monitor] SELL order FAILED (retcode={_rc}, {_cm}) — "
+                              f"will retry in {_ORDER_RETRY_COOLDOWN}s if signal persists")
                         print()
 
             # ---- Trailing stop management ----
