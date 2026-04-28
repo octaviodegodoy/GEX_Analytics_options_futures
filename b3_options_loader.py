@@ -27,6 +27,7 @@ if PARENT_DIR not in sys.path:
     sys.path.insert(1, PARENT_DIR)
 
 from get_b3_data import fetch_b3_historical_file, fetch_open_interest, search_b3_historical_file
+from constants import GEX_DATA_SOURCE
 
 
 def load_b3_options_data(underlying, spot, date=None):
@@ -35,6 +36,8 @@ def load_b3_options_data(underlying, spot, date=None):
     Returns DataFrame with columns:
         Ticker, Tipo, Strike, Ultimo, IV, Delta, Gamma, Tit., VolFin
     """
+
+    # Select data source for OI: RTD (real-time) or B3_HISTORY (historical)
     raw = fetch_b3_historical_file(date)
     if raw.empty:
         print("[*] Primary fetch returned no data — searching recent business days...")
@@ -116,31 +119,36 @@ def load_b3_options_data(underlying, spot, date=None):
         'Expiration': options['Expiration'].values,
     })
 
-    # ---- Merge real OI data if available ----
+
+    # ---- Merge OI data based on GEX_DATA_SOURCE ----
     oi_source = 'daily_volume'
     option_tickers = list(options['ticker'].values)
     try:
-        oi_data = fetch_open_interest(
-            underlying=underlying,
-            multiday_days=5,
-            spot=spot,
-            tickers=option_tickers,
-        )
-        if not oi_data.empty and 'ticker' in oi_data.columns and 'oi' in oi_data.columns:
-            oi_map = oi_data.set_index('ticker')['oi'].to_dict()
-            oi_source = oi_data['oi_source'].iloc[0] if 'oi_source' in oi_data.columns else 'external'
-
-            # Replace Tit. with real OI where available
-            matched = 0
-            for idx, row in df.iterrows():
-                ticker = row['Ticker']
-                if ticker in oi_map and oi_map[ticker] > 0:
-                    df.at[idx, 'Tit.'] = oi_map[ticker]
-                    matched += 1
-
-            print(f"[*] OI source: {oi_source} | Matched {matched}/{len(df)} options")
+        if GEX_DATA_SOURCE == "RTD":
+            oi_data = fetch_open_interest(
+                underlying=underlying,
+                multiday_days=5,
+                spot=spot,
+                tickers=option_tickers,
+            )
+            if not oi_data.empty and 'ticker' in oi_data.columns and 'oi' in oi_data.columns:
+                oi_map = oi_data.set_index('ticker')['oi'].to_dict()
+                oi_source = oi_data['oi_source'].iloc[0] if 'oi_source' in oi_data.columns else 'external'
+                matched = 0
+                for idx, row in df.iterrows():
+                    ticker = row['Ticker']
+                    if ticker in oi_map and oi_map[ticker] > 0:
+                        df.at[idx, 'Tit.'] = oi_map[ticker]
+                        matched += 1
+                print(f"[*] OI source: {oi_source} | Matched {matched}/{len(df)} options")
+            else:
+                print("[*] OI source: daily_volume (no better source available)")
+        elif GEX_DATA_SOURCE == "B3_HISTORY":
+            # Use only B3 historical OI (from raw file)
+            # No replacement of Tit. with RTD or external OI
+            print("[*] OI source: B3_HISTORY (using only B3 historical OI from file)")
         else:
-            print("[*] OI source: daily_volume (no better source available)")
+            print(f"[*] Unknown GEX_DATA_SOURCE: {GEX_DATA_SOURCE} (defaulting to daily_volume)")
     except Exception as e:
         print(f"[*] OI source: daily_volume (fetch error: {e})")
 

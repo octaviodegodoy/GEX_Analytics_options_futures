@@ -49,6 +49,7 @@ from constants import GEX_SEND_ORDERS, GEX_MONITOR_ENABLED
 from gex_utils import find_gamma_flip, compute_weekly_walls, generate_gex_trade_signals
 from gex_plots import plot_gex_weekly
 from b3_options_loader import load_b3_options_data
+
 from flyagonal_strategy import build_flyagonal, format_flyagonal_snapshot
 from mt5_connector import MT5Connector
 from di1_rate_curve import build_di1_curve
@@ -78,10 +79,12 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
     win_symbol: current WIN futures contract name (e.g. "WINM26").
     mt5_conn: MT5Connector instance for placing pending orders.
     """
+
     df = load_b3_options_data(underlying, spot)
     if df.empty:
         print(f"[X] No options data available for {underlying}")
         return
+
 
     df = df.dropna(subset=['Strike', 'IV', 'Gamma'])
     df = df[df['Strike'] > 0]

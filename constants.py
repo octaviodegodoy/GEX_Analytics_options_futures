@@ -6,7 +6,7 @@ CALL_OPTION = 0
 UNIX_DAYS_IN_SECONDS = 60*60*24
 MIN_DAYS_TO_EXPIRY = 35*UNIX_DAYS_IN_SECONDS # 45 days in seconds
 ASSET_SYMBOL = ["BOVA11", "VALE3","HASH11","PETR4","ITUB4","BBAS3"] #, "GOAU4", "BBAS3", "BRAV3", "ITUB4", "BBDC4", "MGLU3", "RAIZ4"]
-PLOT_GEX = False  # Set to False to skip all GEX chart generation
+PLOT_GEX = True  # Set to False to skip all GEX chart generation
 
 # --- TRADING MODE SELECTOR ---
 # Choose "CONSERVATIVE" for low-risk defaults, "MODERATE" for balanced risk
@@ -18,6 +18,10 @@ GEX_ORDER_DEVIATION = 5            # Price deviation allowed (points)
 GEX_MONITOR_INTERVAL = 5          # Spot price poll interval in seconds (faster for tighter trailing)
 GEX_MONITOR_ENABLED = True       # Set to True to start real-time GEX monitor after analysis
 GEX_RTD_REFRESH_INTERVAL = 300   # Re-read RTD OI file every N seconds (0 = disabled)
+
+# --- GEX Data Source Selector ---
+# Set to "RTD" for real-time, "B3_HISTORY" for historical B3 data
+GEX_DATA_SOURCE = "B3_HISTORY"  # Options: "RTD", "B3_HISTORY"
 
 # --- Confirmation & Setup Filters (Fixed across all modes) ---
 GEX_REQUIRE_5M_CONFIRMATION = True  # Require 5-minute directional confirmation before entry

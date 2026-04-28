@@ -1,3 +1,4 @@
+
 import math
 from contextlib import contextmanager
 
@@ -5,12 +6,32 @@ import MetaTrader5 as mt5
 import numpy as np
 import pandas as pd
 
+import matplotlib.pyplot as plt
+
+import logging
+import os
+from datetime import datetime
+
 import b3_options_loader
 import get_b3_data
 from gex_utils import compute_weekly_walls, find_gamma_flip
-from main import _select_significant_zones
+from gex_zones import select_significant_zones as _select_significant_zones
 from mt5_connector import MT5Connector
 from rtd_oi_reader import read_rtd_oi
+
+# --- LOGGING SETUP ---
+log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"gex_report_{datetime.now().strftime('%Y%m%d')}.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(log_file, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 
 def _resolve_bova11_spot(mt5_conn: MT5Connector) -> float:
@@ -72,11 +93,44 @@ def _compute_report(spot: float, use_rtd: bool) -> dict:
     oi_mode = "RTD_CSV" if use_rtd else "B3_VOLUME_PROXY"
     override = b3_options_loader.fetch_open_interest if use_rtd else _multiday_only_open_interest
 
+
     with _loader_open_interest_override(override):
         df = b3_options_loader.load_b3_options_data("BOVA11", spot)
 
     if df.empty:
+        logger.error(f"No BOVA11 options data returned for mode {oi_mode}")
         raise RuntimeError(f"No BOVA11 options data returned for mode {oi_mode}")
+
+    # --- DATA QUALITY CHECKS ---
+    warnings = []
+    # 1. Check for missing strikes (large gaps)
+    strikes = sorted(df['Strike'].unique())
+    if len(strikes) > 1:
+        gaps = [b - a for a, b in zip(strikes[:-1], strikes[1:])]
+        max_gap = max(gaps)
+        if max_gap > 2 * np.median(gaps):
+            warnings.append(f"WARNING: Large gap detected in strikes (max gap: {max_gap:.2f})")
+
+    # 2. Check for stale data (no options with today's expiration or recent business day)
+    today = pd.Timestamp.now().normalize()
+    if not any(pd.to_datetime(df['Expiration']).dt.normalize() >= today):
+        warnings.append("WARNING: No options with expiration >= today (data may be stale)")
+
+    # 3. Check for suspicious OI/volume (all zeros or extreme outliers)
+    if (df['Tit.'] == 0).all():
+        warnings.append("WARNING: All open interest (Tit.) values are zero!")
+    if (df['VolFin'] == 0).all():
+        warnings.append("WARNING: All volume (VolFin) values are zero!")
+    if df['Tit.'].max() > 10 * (df['Tit.'].median() if df['Tit.'].median() > 0 else 1):
+        warnings.append("WARNING: Extreme OI outlier detected (max much greater than median)")
+    if df['VolFin'].max() > 10 * (df['VolFin'].median() if df['VolFin'].median() > 0 else 1):
+        warnings.append("WARNING: Extreme volume outlier detected (max much greater than median)")
+
+    # 4. Check for low number of strikes or contracts
+    if len(strikes) < 5:
+        warnings.append(f"WARNING: Very few strikes found ({len(strikes)})")
+    if len(df) < 10:
+        warnings.append(f"WARNING: Very few option contracts found ({len(df)})")
 
     sign = np.where(df["Tipo"].str.upper().str.contains("PUT"), -1.0, 1.0)
     df["GEX_customer"] = df["Gamma"] * (spot ** 2) * df["Tit."] * sign
@@ -143,6 +197,7 @@ def _compute_report(spot: float, use_rtd: bool) -> dict:
         "rtd_rows": rtd_rows,
         "rtd_sum": rtd_sum,
         "rtd_matched": rtd_matched,
+        "warnings": warnings,
     }
 
 
@@ -159,24 +214,56 @@ def _fmt_pct(value: float) -> str:
 
 
 def _print_report(report: dict) -> None:
-    print(f"\n{'=' * 90}")
-    print(f"BOVA11 DAILY GEX REPORT -- {report['oi_mode']}")
-    print(f"{'=' * 90}")
-    print(f"Spot           : {_fmt_num(report['spot'])}")
-    print(f"Chain Rows     : {report['chain_rows']}")
-    print(f"Call Wall      : {_fmt_num(report['call_wall'])}")
-    print(f"Put Wall       : {_fmt_num(report['put_wall'])}")
-    print(f"Gamma Flip     : {_fmt_num(report['gamma_flip'])}")
-    print(f"Total GEX      : {_fmt_num(report['total_gex'])}")
-    print(f"Peak Strike    : {_fmt_num(report['peak_strike'])}")
-    print(f"Peak GEX       : {_fmt_num(report['peak_gex'])}")
-    print(f"Total Call OI  : {_fmt_num(report['total_call_oi'])}")
-    print(f"Total Put OI   : {_fmt_num(report['total_put_oi'])}")
-    print(f"PCR            : {_fmt_pct(report['pcr'])}")
+    logger.info(f"{'=' * 90}")
+    logger.info(f"BOVA11 DAILY GEX REPORT -- {report['oi_mode']}")
+    logger.info(f"{'=' * 90}")
+    logger.info(f"Spot           : {_fmt_num(report['spot'])}")
+    logger.info(f"Chain Rows     : {report['chain_rows']}")
+    logger.info(f"Call Wall      : {_fmt_num(report['call_wall'])}")
+    logger.info(f"Put Wall       : {_fmt_num(report['put_wall'])}")
+    logger.info(f"Gamma Flip     : {_fmt_num(report['gamma_flip'])}")
+    logger.info(f"Total GEX      : {_fmt_num(report['total_gex'])}")
+    logger.info(f"Peak Strike    : {_fmt_num(report['peak_strike'])}")
+    logger.info(f"Peak GEX       : {_fmt_num(report['peak_gex'])}")
+    logger.info(f"Total Call OI  : {_fmt_num(report['total_call_oi'])}")
+    logger.info(f"Total Put OI   : {_fmt_num(report['total_put_oi'])}")
+    logger.info(f"PCR            : {_fmt_pct(report['pcr'])}")
     if report['oi_mode'] == 'RTD_CSV':
-        print(f"RTD CSV Rows   : {report['rtd_rows']}")
-        print(f"RTD OI Sum     : {report['rtd_sum']:,}")
-        print(f"RTD Matched    : {report['rtd_matched']}")
+        logger.info(f"RTD CSV Rows   : {report['rtd_rows']}")
+        logger.info(f"RTD OI Sum     : {report['rtd_sum']:,}")
+        logger.info(f"RTD Matched    : {report['rtd_matched']}")
+
+    # Print any data quality warnings
+    if 'warnings' in report and report['warnings']:
+        logger.warning("DATA QUALITY WARNINGS:")
+        for w in report['warnings']:
+            logger.warning(f"- {w}")
+
+    # --- GEX BY STRIKE PLOT ---
+    try:
+        strikes = report['top_strikes']['Strike'].values if not report['top_strikes'].empty else []
+        gex = report['top_strikes']['GEX_customer'].values if not report['top_strikes'].empty else []
+        if len(strikes) > 0 and len(gex) > 0:
+            plt.figure(figsize=(10, 6))
+            plt.bar(strikes, gex, color=np.where(np.array(gex) > 0, 'royalblue', 'tomato'))
+            plt.axhline(0, color='black', linewidth=0.8)
+            if np.isfinite(report.get('gamma_flip', float('nan'))):
+                plt.axvline(report['gamma_flip'], color='purple', linestyle='--', label='Gamma Flip')
+            if np.isfinite(report.get('call_wall', float('nan'))):
+                plt.axvline(report['call_wall'], color='green', linestyle=':', label='Call Wall')
+            if np.isfinite(report.get('put_wall', float('nan'))):
+                plt.axvline(report['put_wall'], color='red', linestyle=':', label='Put Wall')
+            plt.title(f"BOVA11 GEX by Strike ({report['oi_mode']})")
+            plt.xlabel('Strike')
+            plt.ylabel('Customer GEX')
+            plt.legend()
+            plt.tight_layout()
+            plot_path = f"bova11_gex_by_strike_{report['oi_mode'].lower()}.png"
+            plt.savefig(plot_path)
+            plt.close()
+            logger.info(f"GEX by strike plot saved as {plot_path}")
+    except Exception as e:
+        logger.error(f"[Plotting Error] {e}")
 
     print("\nTOP CUSTOMER GEX STRIKES")
     print(report["top_strikes"].to_string(index=False, formatters={
@@ -241,6 +328,7 @@ def main() -> None:
     try:
         spot = _resolve_bova11_spot(mt5_conn)
         if not np.isfinite(spot) or spot <= 0:
+            logger.error("Could not resolve BOVA11 spot price")
             raise RuntimeError("Could not resolve BOVA11 spot price")
 
         with_rtd = _compute_report(spot, use_rtd=True)
@@ -249,6 +337,8 @@ def main() -> None:
         _print_report(with_rtd)
         _print_report(no_rtd)
         _print_comparison(with_rtd, no_rtd)
+    except Exception as e:
+        logger.exception(f"[FATAL ERROR] {e}")
     finally:
         mt5.shutdown()
 
