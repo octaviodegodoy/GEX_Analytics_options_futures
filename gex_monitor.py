@@ -64,8 +64,12 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
 
     Stops when both BUY and SELL sides have been executed, or on KeyboardInterrupt.
     """
-    # Late import to avoid circular dependency main.py <-> gex_monitor.py
-    from main import analyze_options
+    # Late import to avoid circular dependency main_gex.py <-> gex_monitor.py
+    try:
+        from main_gex import analyze_options
+    except ModuleNotFoundError as e:
+        print("[ERROR] Could not import 'analyze_options' from 'main_gex':", e)
+        raise
     from rtd_oi_reader import rtd_data_changed
 
     def _refresh_win_contract(current_symbol, current_mapper, mt5c):

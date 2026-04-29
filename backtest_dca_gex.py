@@ -622,7 +622,7 @@ def check_market_open_spread_analysis(asset='BOVA11', force_market_hours=False):
     import MetaTrader5 as mt5
     from mt5_connector import MT5Connector
     from di1_rate_curve import build_di1_curve
-    from main import analyze_options
+    from main_gex import analyze_options
 
     mt5_conn = MT5Connector()
     build_di1_curve(mt5_conn)

@@ -499,15 +499,36 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
 
 
 async def main():
+    print("[DEBUG] main() started")
     mt5_conn = MT5Connector()
+    # --- Debug: Print current WIN and BOVA11 prices ---
+    win_symbol, prev_win = mt5_conn.get_win_symbols()
+    bova_info = mt5_conn.get_symbol_info("BOVA11")
+    win_info = mt5_conn.get_symbol_info(win_symbol) if win_symbol else None
+    bova_price = (bova_info.bid + bova_info.ask) / 2 if bova_info and bova_info.bid > 0 and bova_info.ask > 0 else None
+    win_price = (win_info.bid + win_info.ask) / 2 if win_info and win_info.bid > 0 and win_info.ask > 0 else None
+    if bova_info:
+        print(f"[DEBUG] BOVA11 price: {bova_price} (bid={bova_info.bid}, ask={bova_info.ask})")
+    else:
+        print("[DEBUG] Could not fetch BOVA11 symbol info")
+    if win_info:
+        print(f"[DEBUG] WIN price: {win_price} (bid={win_info.bid}, ask={win_info.ask}) [{win_symbol}]")
+    else:
+        print(f"[DEBUG] Could not fetch WIN symbol info for {win_symbol}")
+
+    # --- After mapper is built, print regression parameters and mapping ---
+    # This will be after the win_mapper is built below
 
     # Build DI1 term-structure once (spline-interpolated per expiry)
+    print("[DEBUG] DI1 curve build starting")
     build_di1_curve(mt5_conn)
+    print("[DEBUG] DI1 curve build finished")
 
     # Build Kalman mapper WIN <-> BOVA11 on 15-min bars (best for intraday)
     win_mapper = None
     win_symbol = ""
     expiring_symbol = None
+    print("[DEBUG] Starting WIN/BOVA11 Kalman mapper build")
     if "BOVA11" in ASSET_SYMBOL:
         try:
             (_exp_time, win_symbol), expiring_symbol = mt5_conn.get_symbol_futures(
@@ -526,7 +547,10 @@ async def main():
         if expiring_symbol and expiring_symbol not in ind_symbols_to_try:
             ind_symbols_to_try.append(expiring_symbol)
 
+
+
         for ind_sym in ind_symbols_to_try:
+            print(f"[DEBUG] Trying to build mapper for symbol: {ind_sym}")
             try:
                 win_mapper = build_ind_bova11_mapper_intraday(
                     mt5_conn, ind_symbol=win_symbol, bova11_symbol="BOVA11"
@@ -540,9 +564,34 @@ async def main():
                 except Exception as e2:
                     print(f"[!] Daily mapper also failed for {win_symbol}: {e2}")
 
+        # Debug: Print Kalman regression parameters and sample conversion
+        if win_mapper is not None:
+            print(f"[DEBUG] KalmanPriceMapper alpha: {win_mapper.alpha}")
+            print(f"[DEBUG] KalmanPriceMapper beta: {win_mapper.beta}")
+            print(f"[DEBUG] KalmanPriceMapper exp(alpha): {np.exp(win_mapper.alpha)} (should be close to 1000)")
+            # Try a sample conversion with the actual BOVA11 price
+            if bova_price:
+                win_est = win_mapper.bova11_to_ind(bova_price)
+                print(f"[DEBUG] WIN estimate from BOVA11={bova_price}: {win_est}")
+                if win_price:
+                    print(f"[DEBUG] Actual WIN price: {win_price}")
+                    diff = abs(win_est - win_price)
+                    print(f"[DEBUG] Difference (mapped - actual): {diff}")
+                else:
+                    print("[DEBUG] Actual WIN price not available for comparison.")
+            else:
+                print("[DEBUG] BOVA11 price not available for mapping.")
+            # Warn if regression is out of expected range
+            if not (0.7 <= win_mapper.beta <= 1.3):
+                print(f"[WARNING] Kalman regression beta out of expected range: {win_mapper.beta}")
+            if not (900 <= np.exp(win_mapper.alpha) <= 1100):
+                print(f"[WARNING] Kalman regression exp(alpha) out of expected range: {np.exp(win_mapper.alpha)}")
+
         if not ind_symbols_to_try:
             print("[!] No WIN contract resolved -- no mapper available")
+        print("[DEBUG] Mapper build step finished")
 
+    print("[DEBUG] Checking asset scope and monitor flags")
     _assets_upper = {str(a).upper() for a in ASSET_SYMBOL}
     _is_bova11_scope = "BOVA11" in _assets_upper
     _is_win_symbol = bool(win_symbol) and str(win_symbol).upper().startswith("WIN")
@@ -550,12 +599,14 @@ async def main():
         GEX_MONITOR_ENABLED and GEX_SEND_ORDERS and _is_bova11_scope and _is_win_symbol
     )
 
+    print("[DEBUG] Preparing analysis asset list")
     analysis_assets = list(ASSET_SYMBOL)
     if _prioritize_live_monitor and "BOVA11" in analysis_assets:
         analysis_assets = ["BOVA11"] + [asset for asset in analysis_assets if asset != "BOVA11"]
 
     bova11_gex = None
     remaining_assets = []
+    print("[DEBUG] Starting asset analysis loop")
     for asset in analysis_assets:
         print(f"\n{'#'*80}\nAnalyzing {asset}...\n{'#'*80}")
         symbol_info = mt5_conn.get_symbol_info(asset)
@@ -569,6 +620,7 @@ async def main():
         print(f"Analyzing options data for {asset} with spot price {spot_price:.2f}...")
         mapper_for_asset = win_mapper if asset == "BOVA11" else None
         win_sym_for_asset = win_symbol if asset == "BOVA11" else ""
+        print(f"[DEBUG] Calling analyze_options for {asset} with spot {spot_price}")
         result = await analyze_options(
             spot_price,
             asset,
@@ -576,6 +628,7 @@ async def main():
             win_symbol=win_sym_for_asset,
             mt5_conn=mt5_conn,
         )
+        print(f"[DEBUG] analyze_options finished for {asset}")
         if asset == "BOVA11" and result is not None:
             bova11_gex = result
             if _prioritize_live_monitor:
@@ -617,4 +670,5 @@ async def main():
 
 
 if __name__ == "__main__":
+    print("[DEBUG] __main__ entry reached, running main()...")
     asyncio.run(main())

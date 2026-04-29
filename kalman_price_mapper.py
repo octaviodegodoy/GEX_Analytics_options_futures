@@ -21,16 +21,16 @@ from constants import PERIODS, SHIFT_PERIODS
 # ============================================================
 class KalmanPriceMapper:
     """
-    Uses a Kalman Filter to dynamically estimate the linear relationship
+    Uses a Kalman Filter to dynamically estimate the log-linear relationship
     between $IND (Bovespa index futures) and BOVA11 (Bovespa ETF):
 
-        P_IND = alpha + beta * P_BOVA11
+        log(WIN) = alpha + beta * log(BOVA11)
 
-    After fitting on historical data, converts BOVA11 prices (e.g. GEX
+    After fitting on historical data (always in log-price space!), converts BOVA11 prices (e.g. GEX
     strike levels) to their $IND equivalents and vice-versa.
 
     State vector: [alpha, beta]
-    Observation:  P_IND_t = [1, P_BOVA11_t] · [alpha_t, beta_t]' + noise
+    Observation:  log(WIN)_t = [1, log(BOVA11)_t] · [alpha_t, beta_t]' + noise
     """
 
     def __init__(self,
@@ -67,18 +67,21 @@ class KalmanPriceMapper:
         self.betas: list = []
 
     # ── core update ──────────────────────────────────────────
-    def update(self, ind_price: float, bova11_price: float):
-        """Single-step Kalman update with new price pair."""
-        H = np.array([1.0, bova11_price])              # observation vector
+    def update(self, ind_log: float, bova11_log: float):
+        """
+        Single-step Kalman update with new log-price pair.
+        Both arguments must be log-prices (not linear prices).
+        """
+        assert ind_log < 30 and bova11_log < 10, "update() expects log-prices, not linear prices!"
+        H = np.array([1.0, bova11_log])              # observation vector (log BOVA11)
 
         # Predict
         P_pred = self.P + self.Q
 
         # Innovation
         y_hat = H @ self.state
-        innovation = ind_price - y_hat
+        innovation = ind_log - y_hat
         S = H @ P_pred @ H + self.R                     # innovation variance
-
         # Kalman gain
         K = (P_pred @ H) / S                             # (2,)
 
@@ -93,17 +96,20 @@ class KalmanPriceMapper:
     def fit(self, ind_prices: np.ndarray, bova11_prices: np.ndarray) -> pd.DataFrame:
         """
         Run the filter over aligned historical arrays.
+        CRITICAL: Both arrays MUST be log-prices (not linear prices)!"
 
         Returns a DataFrame with columns:
             ind, bova11, alpha, beta, ind_estimated, residual
         """
         assert len(ind_prices) == len(bova11_prices), "Series must be same length"
+        # Enforce log-price input
+        assert np.all(ind_prices < 30) and np.all(bova11_prices < 10), "fit() expects log-prices, not linear prices!"
 
         self.alphas.clear()
         self.betas.clear()
 
-        for ind_p, bova_p in zip(ind_prices, bova11_prices):
-            self.update(ind_p, bova_p)
+        for ind_log, bova11_log in zip(ind_prices, bova11_prices):
+            self.update(ind_log, bova11_log)
 
         alphas = np.array(self.alphas)
         betas = np.array(self.betas)
@@ -218,12 +224,13 @@ def build_ind_bova11_mapper(mt5_conn,
             "a reliable calibration."
         )
 
-    # Calculate log prices
+
+    # Calculate log prices (always fit in log space!)
     merged['ind_log'] = np.log(merged['ind'])
     merged['bova11_log'] = np.log(merged['bova11'])
     merged = merged.dropna(subset=['ind_log', 'bova11_log'])
 
-    # Estimate sensible initial beta from OLS on last 60 log prices
+    # Estimate sensible initial alpha+beta from OLS on last 60 log prices
     lookback = min(60, len(merged))
     # OLS: y = alpha + beta * x, so x = bova11_log, y = ind_log
     ols_coeffs = np.polyfit(
@@ -231,12 +238,16 @@ def build_ind_bova11_mapper(mt5_conn,
         merged['ind_log'].values[-lookback:], 1
     )
     ols_beta = ols_coeffs[0]
+    ols_alpha = ols_coeffs[1]
 
     mapper = KalmanPriceMapper(
         delta=delta,
         observation_noise=observation_noise,
+        initial_alpha=ols_alpha,
         initial_beta=ols_beta,
+        initial_variance=1e-4,
     )
+    # Always fit in log-price space
     results = mapper.fit(
         merged['ind_log'].values,
         merged['bova11_log'].values
@@ -337,7 +348,9 @@ def build_ind_bova11_mapper_intraday(
             results_table.append((days, n_bars, 0, np.nan, "no data"))
             continue
 
-        # Align on timestamp
+        # Align on timestamp.
+        # NOTE: WIN futures price IS already quoted in index points (~130k-200k);
+        # WIN_POINT_VALUE=0.20 BRL/pt is only a P&L multiplier — do NOT scale prices by it.
         df_i = df_ind.set_index('time')[['close']].rename(columns={'close': 'ind'})
         df_b = df_bova.set_index('time')[['close']].rename(columns={'close': 'bova11'})
         merged = df_i.join(df_b, how='inner').dropna()
@@ -351,20 +364,34 @@ def build_ind_bova11_mapper_intraday(
         ind_log = np.log(merged['ind'].values)
         bova_log = np.log(merged['bova11'].values)
 
+        # Debug: Print merged DataFrame head and log-price stats
+        print(f"[DEBUG] Merged DataFrame shape: {merged.shape}")
+        print(f"[DEBUG] Merged DataFrame head:\n{merged.head()}")
+        print(f"[DEBUG] ind_log[:5]: {ind_log[:5]}")
+        print(f"[DEBUG] bova_log[:5]: {bova_log[:5]}")
+
         # Train/test split (80/20)
         split = int(len(merged) * 0.8)
         train_ind, test_ind = ind_log[:split], ind_log[split:]
         train_bova, test_bova = bova_log[:split], bova_log[split:]
 
-        # OLS seed
+        # OLS seed -- get BOTH alpha (intercept) and beta (slope) from log-price OLS.
+        # CRITICAL: alpha must be seeded too, otherwise initial_alpha=0 forces a huge
+        # innovation that pushes beta to absorb log(WIN) ~12 / log(BOVA11) ~5 ~= 2.3.
         lookback = min(60, len(train_ind))
         ols_coeffs = np.polyfit(train_bova[-lookback:], train_ind[-lookback:], 1)
+        ols_beta_seed = ols_coeffs[0]
+        ols_alpha_seed = ols_coeffs[1]
+        print(f"[DEBUG] OLS seed alpha: {ols_alpha_seed:.4f}  beta: {ols_beta_seed:.4f}")
 
-        # Fit on train
+        # Rigid Kalman: tiny process noise + tiny initial covariance keeps the
+        # filter anchored near OLS so it cannot drift to implausible betas.
         mapper = KalmanPriceMapper(
-            delta=delta,
-            observation_noise=observation_noise,
-            initial_beta=ols_coeffs[0],
+            delta=1e-7,
+            observation_noise=1e-3,
+            initial_alpha=ols_alpha_seed,
+            initial_beta=ols_beta_seed,
+            initial_variance=1e-4,
         )
         mapper.fit(train_ind, train_bova)
 
@@ -423,27 +450,33 @@ def build_ind_bova11_mapper_intraday(
     lookback = min(60, len(merged))
     ols_coeffs = np.polyfit(bova_log[-lookback:], ind_log[-lookback:], 1)
     seed_beta = ols_coeffs[0]
+    seed_alpha = ols_coeffs[1]
 
-    # If OLS seed is implausible (e.g. tiny lookback, broker glitch), fall
-    # back to the structural prior of log-beta=1.0 (IND \u2248 1000 \u00d7 BOVA11).
+    # If OLS seed is implausible (e.g. tiny lookback, broker glitch), fall back
+    # to a structural prior derived from the LATEST observed ratio (not a hardcoded 1000x):
     if not (LOG_BETA_MIN <= seed_beta <= LOG_BETA_MAX):
         print(f"  [!] OLS seed beta={seed_beta:.3f} out of range "
-              f"[{LOG_BETA_MIN},{LOG_BETA_MAX}] \u2014 falling back to structural prior beta=1.0")
+              f"[{LOG_BETA_MIN},{LOG_BETA_MAX}] \u2014 falling back to beta=1.0 anchored on latest observed ratio")
         seed_beta = 1.0
+        # alpha so that latest log(WIN) = alpha + 1.0 * latest log(BOVA11)
+        seed_alpha = float(ind_log[-1] - bova_log[-1])
 
+    # Rigid Kalman: anchor tightly to OLS seed so beta cannot drift.
     final_mapper = KalmanPriceMapper(
-        delta=delta,
-        observation_noise=observation_noise,
+        delta=1e-7,
+        observation_noise=1e-3,
+        initial_alpha=seed_alpha,
         initial_beta=seed_beta,
+        initial_variance=1e-4,
     )
     results_df = final_mapper.fit(ind_log, bova_log)
 
     # Final sanity guard on the fitted log-beta.
     if not (LOG_BETA_MIN <= final_mapper.beta <= LOG_BETA_MAX):
         print(f"  [!] Final fit beta={final_mapper.beta:.3f} out of range \u2014 "
-              f"clamping to structural prior (alpha=ln(1000), beta=1.0)")
-        final_mapper.state[0] = float(np.log(1000.0))
+              f"clamping to beta=1.0 anchored on latest observed ratio")
         final_mapper.state[1] = 1.0
+        final_mapper.state[0] = float(ind_log[-1] - bova_log[-1])
 
     print(f"\n  Winner: {best_days} days ({len(merged)} bars of 15-min)")
     print(f"  MAE:    {best_mae:.1f} index points")
