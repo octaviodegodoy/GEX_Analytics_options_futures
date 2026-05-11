@@ -26,7 +26,7 @@ GEX_DATA_SOURCE = "B3_HISTORY"  # Options: "RTD", "B3_HISTORY"
 # --- Confirmation & Setup Filters (Fixed across all modes) ---
 GEX_REQUIRE_5M_CONFIRMATION = True  # Require 5-minute directional confirmation before entry
 GEX_CONFIRMATION_MINUTES = 5        # Confirmation window in minutes
-GEX_NEUTRAL_ONLY = True            # Only enter in neutral setup (between walls and near gamma flip)
+GEX_NEUTRAL_ONLY = False            # Only enter in neutral setup (between walls and near gamma flip)
 GEX_NEUTRAL_MAX_FLIP_DISTANCE_PCT = 0.005  # Max distance to flip for neutral setup (0.5%)
 
 # --- PROFILE: CONSERVATIVE (Low risk, smaller size, fewer DCA) ---

@@ -35,7 +35,7 @@ from constants import (
     GEX_REQUIRE_5M_CONFIRMATION, GEX_CONFIRMATION_MINUTES,
     GEX_NEUTRAL_ONLY, GEX_NEUTRAL_MAX_FLIP_DISTANCE_PCT,
 )
-from gex_utils import generate_gex_trade_signals
+from gex_utils import generate_gex_trade_signals, signal_requires_neutral_filter
 from gex_zones import (
     nearest_support_resistance,
     is_neutral_setup,
@@ -388,7 +388,11 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
 
             buy_confirm_ok = (not GEX_REQUIRE_5M_CONFIRMATION) or (buy_confirm_ticks >= _confirm_ticks)
             sell_confirm_ok = (not GEX_REQUIRE_5M_CONFIRMATION) or (sell_confirm_ticks >= _confirm_ticks)
-            neutral_ok = (not GEX_NEUTRAL_ONLY) or is_neutral_setup(
+            # Only apply the neutral-setup filter to gamma-flip proximity trades
+            # (buy_setup_near_gamma_flip). Regular regime signals (negative/positive
+            # gamma bounces) must not be blocked by this filter.
+            _needs_neutral = GEX_NEUTRAL_ONLY and signal_requires_neutral_filter(signal)
+            neutral_ok = (not _needs_neutral) or is_neutral_setup(
                 bova_spot, gamma_flip, call_wall, put_wall, GEX_NEUTRAL_MAX_FLIP_DISTANCE_PCT
             )
 
