@@ -163,7 +163,8 @@ def load_b3_options_data(underlying, spot, date=None):
     today = pd.Timestamp.now().normalize()
     df['Expiration'] = pd.to_datetime(df['Expiration'])
     all_expirations = sorted(df['Expiration'].dt.normalize().unique())
-    future_expirations = [d for d in all_expirations if d >= today]
+    # Use strictly > today so same-day expiries (already expiring today) are excluded
+    future_expirations = [d for d in all_expirations if d > today]
     if not future_expirations:
         future_expirations = all_expirations[-2:] if len(all_expirations) >= 2 else all_expirations
 

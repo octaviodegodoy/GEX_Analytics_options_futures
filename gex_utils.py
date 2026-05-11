@@ -66,9 +66,10 @@ def compute_weekly_walls(df: pd.DataFrame, spot: float):
     # All available expiration dates, sorted
     all_expirations = sorted(df['Expiration'].dt.date.unique())
 
-    # Pick the two nearest expirations >= today (B3 options don't always
-    # expire on Fridays, so we use the actual dates from the data).
-    future_expirations = [d for d in all_expirations if d >= today.date()]
+    # Pick the two nearest expirations strictly after today (B3 options don't
+    # always expire on Fridays, so we use the actual dates from the data).
+    # Strictly > today excludes same-day expiries that are already winding down.
+    future_expirations = [d for d in all_expirations if d > today.date()]
     if not future_expirations:
         # Everything already expired — use the last two available dates
         future_expirations = all_expirations[-2:] if len(all_expirations) >= 2 else all_expirations
