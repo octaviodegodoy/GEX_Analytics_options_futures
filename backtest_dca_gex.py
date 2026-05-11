@@ -217,7 +217,6 @@ def _build_spread_candidates(asset, spot, analysis_result):
     from b3_options_loader import load_b3_options_data
     from bs_greeks import implied_vol, bs_gamma, bs_delta
     from di1_rate_curve import get_rate_for_date
-    from rtd_oi_reader import read_rtd_option_snapshot
 
     df = load_b3_options_data(asset, spot)
     if df.empty:
@@ -228,76 +227,6 @@ def _build_spread_candidates(asset, spot, analysis_result):
     df = df.dropna(subset=['Expiration', 'Strike', 'Ultimo'])
     if df.empty:
         return None
-
-    # Prefer live RTD fields (ULT/PEX/CAB) for option price/strike/OI when available.
-    tickers = [str(t).strip().upper() for t in df['Ticker'].dropna().astype(str).unique().tolist()]
-    rtd = read_rtd_option_snapshot(tickers=tickers, attributes=['ULT', 'PEX', 'CAB'], wait_seconds=1.0, refresh_rounds=3)
-    rtd_hits = 0
-    if rtd is not None and not rtd.empty:
-        rtd['ticker'] = rtd['ticker'].astype(str).str.strip().str.upper()
-        rtd_map = rtd.set_index('ticker').to_dict(orient='index')
-
-        def _val(dct, key):
-            if dct is None:
-                return np.nan
-            try:
-                return float(dct.get(key, np.nan))
-            except (ValueError, TypeError):
-                return np.nan
-
-        for i, row in df.iterrows():
-            tk = str(row['Ticker']).strip().upper()
-            snap = rtd_map.get(tk)
-            if snap is None:
-                continue
-            ult = _val(snap, 'ult')
-            pex = _val(snap, 'pex')
-            cab = _val(snap, 'cab')
-            if np.isfinite(ult) and ult > 0:
-                df.at[i, 'Ultimo'] = ult
-                rtd_hits += 1
-            if np.isfinite(pex) and pex > 0:
-                df.at[i, 'Strike'] = pex
-            if np.isfinite(cab) and cab > 0:
-                df.at[i, 'Tit.'] = cab
-
-        # Recompute IV and Greeks from updated RTD price/strike values.
-        new_iv = []
-        new_delta = []
-        new_gamma = []
-        now_date = datetime.now().date()
-        for _, row in df.iterrows():
-            exp = pd.to_datetime(row['Expiration'], errors='coerce')
-            if pd.isna(exp):
-                T = 1 / 252.0
-                r = 0.10
-            else:
-                dte = max(int(np.busday_count(now_date, exp.date())), 0)
-                T = max(dte / 252.0, 1 / 252.0)
-                r = get_rate_for_date(exp)
-            opt_type = str(row['Tipo']).lower()
-            strike = float(row['Strike']) if np.isfinite(row['Strike']) else np.nan
-            price = float(row['Ultimo']) if np.isfinite(row['Ultimo']) else np.nan
-            if np.isfinite(price) and price > 0 and np.isfinite(strike) and strike > 0:
-                iv = implied_vol(price, spot, strike, T, r, opt_type)
-            else:
-                iv = float(row['IV']) if 'IV' in row and np.isfinite(row['IV']) else 0.30
-            new_iv.append(iv)
-            try:
-                new_delta.append(bs_delta(spot, strike, T, r, iv, opt_type))
-                new_gamma.append(bs_gamma(spot, strike, T, r, iv))
-            except Exception:
-                new_delta.append(float(row['Delta']) if 'Delta' in row and np.isfinite(row['Delta']) else np.nan)
-                new_gamma.append(float(row['Gamma']) if 'Gamma' in row and np.isfinite(row['Gamma']) else np.nan)
-
-        df['IV'] = np.array(new_iv)
-        df['Delta'] = np.array(new_delta)
-        df['Gamma'] = np.array(new_gamma)
-
-    if rtd_hits > 0:
-        print(f"[MARKET CHECK] RTD snapshot applied to {rtd_hits} option rows (ULT/PEX/CAB).")
-    else:
-        print("[MARKET CHECK] RTD snapshot unavailable for option rows; using B3-derived values.")
 
     today = pd.Timestamp.now().normalize()
     expirations = sorted([d for d in df['Expiration'].dt.normalize().unique() if d >= today])

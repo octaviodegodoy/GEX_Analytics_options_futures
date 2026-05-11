@@ -1,0 +1,38 @@
+2026-05-11 18:57:16,862 [INFO] ==========================================================================================
+2026-05-11 18:57:16,862 [INFO] BOVA11 DAILY GEX REPORT -- B3_HISTORY
+2026-05-11 18:57:16,862 [INFO] ==========================================================================================
+2026-05-11 18:57:16,862 [INFO] Spot           : 178.57
+2026-05-11 18:57:16,862 [INFO] Chain Rows     : 232
+2026-05-11 18:57:16,862 [INFO] Call Wall      : 186.00
+2026-05-11 18:57:16,863 [INFO] Put Wall       : 178.00
+2026-05-11 18:57:16,863 [INFO] Gamma Flip     : 181.85
+2026-05-11 18:57:16,863 [INFO] Total GEX      : -19,383,224,317.37
+2026-05-11 18:57:16,863 [INFO] Peak Strike    : 178.00
+2026-05-11 18:57:16,863 [INFO] Peak GEX       : -6,704,677,355.92
+2026-05-11 18:57:16,864 [INFO] Total Call OI  : 24,277,436.00
+2026-05-11 18:57:16,864 [INFO] Total Put OI   : 25,878,254.00
+2026-05-11 18:57:16,864 [INFO] PCR            : 1.0659
+2026-05-11 18:57:16,864 [WARNING] DATA QUALITY WARNINGS:
+2026-05-11 18:57:16,864 [WARNING] - WARNING: Large gap detected in strikes (max gap: 29.50)
+2026-05-11 18:57:16,864 [WARNING] - WARNING: Extreme OI outlier detected (max much greater than median)
+2026-05-11 18:57:16,864 [WARNING] - WARNING: Extreme volume outlier detected (max much greater than median)
+2026-05-11 18:57:17,631 [INFO] GEX by strike plot saved as bova11_gex_by_strike_b3_history.png
+2026-05-11 18:58:12,874 [INFO] ==========================================================================================
+2026-05-11 18:58:12,874 [INFO] BOVA11 DAILY GEX REPORT -- B3_HISTORY
+2026-05-11 18:58:12,875 [INFO] ==========================================================================================
+2026-05-11 18:58:12,875 [INFO] Spot           : 178.57
+2026-05-11 18:58:12,875 [INFO] Chain Rows     : 232
+2026-05-11 18:58:12,875 [INFO] Call Wall      : 186.00
+2026-05-11 18:58:12,876 [INFO] Put Wall       : 178.00
+2026-05-11 18:58:12,876 [INFO] Gamma Flip     : 181.85
+2026-05-11 18:58:12,876 [INFO] Total GEX      : -19,383,224,317.37
+2026-05-11 18:58:12,876 [INFO] Peak Strike    : 178.00
+2026-05-11 18:58:12,876 [INFO] Peak GEX       : -6,704,677,355.92
+2026-05-11 18:58:12,876 [INFO] Total Call OI  : 24,277,436.00
+2026-05-11 18:58:12,876 [INFO] Total Put OI   : 25,878,254.00
+2026-05-11 18:58:12,876 [INFO] PCR            : 1.0659
+2026-05-11 18:58:12,876 [WARNING] DATA QUALITY WARNINGS:
+2026-05-11 18:58:12,876 [WARNING] - WARNING: Large gap detected in strikes (max gap: 29.50)
+2026-05-11 18:58:12,876 [WARNING] - WARNING: Extreme OI outlier detected (max much greater than median)
+2026-05-11 18:58:12,877 [WARNING] - WARNING: Extreme volume outlier detected (max much greater than median)
+2026-05-11 18:58:13,100 [INFO] GEX by strike plot saved as bova11_gex_by_strike_b3_history.png

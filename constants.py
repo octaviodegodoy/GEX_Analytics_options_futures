@@ -17,11 +17,6 @@ GEX_SEND_ORDERS = True            # Set to True to enable order execution
 GEX_ORDER_DEVIATION = 5            # Price deviation allowed (points)
 GEX_MONITOR_INTERVAL = 5          # Spot price poll interval in seconds (faster for tighter trailing)
 GEX_MONITOR_ENABLED = True       # Set to True to start real-time GEX monitor after analysis
-GEX_RTD_REFRESH_INTERVAL = 300   # Re-read RTD OI file every N seconds (0 = disabled)
-
-# --- GEX Data Source Selector ---
-# Set to "RTD" for real-time, "B3_HISTORY" for historical B3 data
-GEX_DATA_SOURCE = "B3_HISTORY"  # Options: "RTD", "B3_HISTORY"
 
 # --- Confirmation & Setup Filters (Fixed across all modes) ---
 GEX_REQUIRE_5M_CONFIRMATION = True  # Require 5-minute directional confirmation before entry

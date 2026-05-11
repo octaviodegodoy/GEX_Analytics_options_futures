@@ -6,7 +6,7 @@ Real-time WIN futures tick polling with:
   - Wall-entry triggers gated by signal strength + neutral setup + 5m confirmation
   - Margin-budgeted volume sizing with Fibonacci DCA
   - Trailing stop activated at fixed % of budget
-  - Pre-trade & RTD-driven GEX level refresh
+    - Pre-trade GEX level refresh
   - Daily realized loss cap
 
 Extracted from main.py without behavior changes; the only refactor is
@@ -27,7 +27,6 @@ from constants import (
     GEX_MONITOR_INTERVAL, GEX_MAGIC_NUMBER,
     GEX_MARGIN_FREE_PCT, GEX_SL_RISK_PCT, GEX_TRAILING_ACTIVATION_PCT,
     GEX_DCA_LOSS_STEP_PCT, GEX_DCA_MAX_ORDERS,
-    GEX_RTD_REFRESH_INTERVAL,
     GEX_MIN_SL_POINTS, GEX_TRAILING_DISTANCE_FACTOR,
     GEX_MAX_DAILY_LOSS_PCT, GEX_TP_AT_OPPOSITE_WALL,
     GEX_TRADE_WINDOW_START, GEX_TRADE_WINDOW_END,
@@ -59,9 +58,6 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
     the trade signal with the current spot, and sends a market order when
     a wall entry is triggered with sufficient signal strength.
 
-    When RTD OI file is updated (Profit Pro export), GEX levels are
-    recalculated automatically (controlled by GEX_RTD_REFRESH_INTERVAL).
-
     Stops when both BUY and SELL sides have been executed, or on KeyboardInterrupt.
     """
     # Late import to avoid circular dependency main_gex.py <-> gex_monitor.py
@@ -70,7 +66,6 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
     except ModuleNotFoundError as e:
         print("[ERROR] Could not import 'analyze_options' from 'main_gex':", e)
         raise
-    from rtd_oi_reader import rtd_data_changed
 
     def _refresh_win_contract(current_symbol, current_mapper, mt5c):
         """Re-resolve the WIN futures contract; rebuild mapper if it changed."""
@@ -338,15 +333,11 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
     print(f"  Trailing Factor: {GEX_TRAILING_DISTANCE_FACTOR:.0%} of SL")
     print(f"  TP at Opposite Wall: {'Yes' if GEX_TP_AT_OPPOSITE_WALL else 'No'}")
     print(f"  Budget     : R${margin_budget:,.2f} ({GEX_MARGIN_FREE_PCT:.1%} of margin_free)")
-    print(f"  RTD Refresh : {'every ' + str(GEX_RTD_REFRESH_INTERVAL) + 's' if GEX_RTD_REFRESH_INTERVAL > 0 else 'disabled'}")
     _confirm_ticks = max(1, int(math.ceil((GEX_CONFIRMATION_MINUTES * 60) / max(GEX_MONITOR_INTERVAL, 1))))
     print(f"  5m Confirmation: {'On' if GEX_REQUIRE_5M_CONFIRMATION else 'Off'} ({_confirm_ticks} ticks)")
     print(f"  Neutral Setup Only: {'On' if GEX_NEUTRAL_ONLY else 'Off'} (<= {GEX_NEUTRAL_MAX_FLIP_DISTANCE_PCT:.2%} from flip)")
     print(f"{'='*75}")
     print(f"  Press Ctrl+C to stop monitoring.\n")
-
-    # RTD OI refresh state
-    _rtd_last_check = _time.monotonic()
 
     # Daily loss tracking — halt new entries when exceeded
     _daily_realized_pnl = 0.0
@@ -391,29 +382,6 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                 except Exception as e:
                     ts_now = _dt.now().strftime("%H:%M:%S")
                     print(f"[{ts_now}] [PRE-TRADE] Refresh failed: {e} — keeping old levels")
-
-            # --- RTD OI refresh: recalculate GEX when Profit Pro updates the file ---
-            if GEX_RTD_REFRESH_INTERVAL > 0:
-                now_mono = _time.monotonic()
-                if now_mono - _rtd_last_check >= GEX_RTD_REFRESH_INTERVAL:
-                    _rtd_last_check = now_mono
-                    if rtd_data_changed():
-                        ts_now = _dt.now().strftime("%H:%M:%S")
-                        print(f"\n[{ts_now}] [RTD] OI file updated — recalculating GEX levels...")
-                        try:
-                            win_symbol, win_mapper = _refresh_win_contract(win_symbol, win_mapper, mt5_conn)
-
-                            sym_info = _mt5.symbol_info("BOVA11")
-                            rtd_spot = (sym_info.bid + sym_info.ask) / 2.0 if sym_info else 0.0
-                            await _run_gex_refresh(
-                                "RTD",
-                                rtd_spot,
-                                include_entries=False,
-                                update_tp=False,
-                            )
-                        except Exception as e:
-                            ts_now = _dt.now().strftime("%H:%M:%S")
-                            print(f"[{ts_now}] [RTD] Refresh failed: {e} — keeping old levels")
 
             # Stop when both sides executed and no open GEX positions remain
             if buy_executed and sell_executed:

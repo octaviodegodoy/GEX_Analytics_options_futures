@@ -1,23 +1,28 @@
 
 import math
-from contextlib import contextmanager
-
-import MetaTrader5 as mt5
-import numpy as np
-import pandas as pd
-
-import matplotlib.pyplot as plt
-
 import logging
 import os
+import sys
 from datetime import datetime
+
+try:
+    import MetaTrader5 as mt5
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+except ImportError as exc:
+    missing = getattr(exc, "name", None) or str(exc)
+    raise SystemExit(
+        "Missing required dependency: {missing}. "
+        "Install packages: MetaTrader5, numpy, pandas, matplotlib."
+        .format(missing=missing)
+    ) from exc
 
 import b3_options_loader
 import get_b3_data
 from gex_utils import compute_weekly_walls, find_gamma_flip
 from gex_zones import select_significant_zones as _select_significant_zones
 from mt5_connector import MT5Connector
-from rtd_oi_reader import read_rtd_oi
 
 # --- LOGGING SETUP ---
 log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
@@ -62,16 +67,6 @@ def _multiday_only_open_interest(underlying="BOVA11", oi_csv_path=None, multiday
     return result
 
 
-@contextmanager
-def _loader_open_interest_override(func):
-    original = b3_options_loader.fetch_open_interest
-    b3_options_loader.fetch_open_interest = func
-    try:
-        yield
-    finally:
-        b3_options_loader.fetch_open_interest = original
-
-
 def _build_top_strikes(df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
     work = df.copy()
     work["is_put"] = work["Tipo"].str.upper().str.contains("PUT")
@@ -89,13 +84,9 @@ def _build_top_strikes(df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
     return top[["Strike", "GEX_customer", "bias", "call_oi", "put_oi"]]
 
 
-def _compute_report(spot: float, use_rtd: bool) -> dict:
-    oi_mode = "RTD_CSV" if use_rtd else "B3_VOLUME_PROXY"
-    override = b3_options_loader.fetch_open_interest if use_rtd else _multiday_only_open_interest
-
-
-    with _loader_open_interest_override(override):
-        df = b3_options_loader.load_b3_options_data("BOVA11", spot)
+def _compute_report(spot: float) -> dict:
+    oi_mode = "B3_HISTORY"
+    df = b3_options_loader.load_b3_options_data("BOVA11", spot)
 
     if df.empty:
         logger.error(f"No BOVA11 options data returned for mode {oi_mode}")
@@ -162,21 +153,6 @@ def _compute_report(spot: float, use_rtd: bool) -> dict:
     peak_strike = float(combined.loc[peak_idx, "Strike"])
     peak_gex = float(combined.loc[peak_idx, "GEX_customer"])
 
-    rtd_rows = 0
-    rtd_sum = 0
-    rtd_matched = 0
-    if use_rtd:
-        rtd_df = read_rtd_oi(spot=spot)
-        rtd_rows = int(len(rtd_df))
-        rtd_sum = int(rtd_df["oi"].sum()) if not rtd_df.empty else 0
-        if not rtd_df.empty:
-            merged = df[["Ticker"]].merge(
-                rtd_df.rename(columns={"ticker": "Ticker", "oi": "RTD_OI"}),
-                on="Ticker",
-                how="left",
-            )
-            rtd_matched = int(merged["RTD_OI"].fillna(0).gt(0).sum())
-
     return {
         "oi_mode": oi_mode,
         "spot": float(spot),
@@ -194,9 +170,6 @@ def _compute_report(spot: float, use_rtd: bool) -> dict:
         "resist_zones": resist_zones,
         "support_zones": support_zones,
         "top_strikes": top_strikes,
-        "rtd_rows": rtd_rows,
-        "rtd_sum": rtd_sum,
-        "rtd_matched": rtd_matched,
         "warnings": warnings,
     }
 
@@ -228,11 +201,6 @@ def _print_report(report: dict) -> None:
     logger.info(f"Total Call OI  : {_fmt_num(report['total_call_oi'])}")
     logger.info(f"Total Put OI   : {_fmt_num(report['total_put_oi'])}")
     logger.info(f"PCR            : {_fmt_pct(report['pcr'])}")
-    if report['oi_mode'] == 'RTD_CSV':
-        logger.info(f"RTD CSV Rows   : {report['rtd_rows']}")
-        logger.info(f"RTD OI Sum     : {report['rtd_sum']:,}")
-        logger.info(f"RTD Matched    : {report['rtd_matched']}")
-
     # Print any data quality warnings
     if 'warnings' in report and report['warnings']:
         logger.warning("DATA QUALITY WARNINGS:")
@@ -300,29 +268,6 @@ def _print_report(report: dict) -> None:
         print("NONE")
 
 
-def _print_comparison(with_rtd: dict, no_rtd: dict) -> None:
-    print(f"\n{'=' * 90}")
-    print("COMPARISON -- WITH RTD CSV OI VS B3 VOLUME PROXY")
-    print(f"{'=' * 90}")
-
-    rows = [
-        ("Call Wall", with_rtd["call_wall"], no_rtd["call_wall"]),
-        ("Put Wall", with_rtd["put_wall"], no_rtd["put_wall"]),
-        ("Gamma Flip", with_rtd["gamma_flip"], no_rtd["gamma_flip"]),
-        ("Total GEX", with_rtd["total_gex"], no_rtd["total_gex"]),
-        ("Peak Strike", with_rtd["peak_strike"], no_rtd["peak_strike"]),
-        ("Peak GEX", with_rtd["peak_gex"], no_rtd["peak_gex"]),
-        ("Call OI", with_rtd["total_call_oi"], no_rtd["total_call_oi"]),
-        ("Put OI", with_rtd["total_put_oi"], no_rtd["total_put_oi"]),
-        ("PCR", with_rtd["pcr"], no_rtd["pcr"]),
-    ]
-
-    print(f"{'Metric':<14} {'With RTD':>18} {'No RTD':>18} {'Delta':>18}")
-    for label, a, b in rows:
-        delta = a - b if np.isfinite(a) and np.isfinite(b) else float("nan")
-        print(f"{label:<14} {_fmt_num(a):>18} {_fmt_num(b):>18} {_fmt_num(delta):>18}")
-
-
 def main() -> None:
     mt5_conn = MT5Connector()
     try:
@@ -331,12 +276,8 @@ def main() -> None:
             logger.error("Could not resolve BOVA11 spot price")
             raise RuntimeError("Could not resolve BOVA11 spot price")
 
-        with_rtd = _compute_report(spot, use_rtd=True)
-        no_rtd = _compute_report(spot, use_rtd=False)
-
-        _print_report(with_rtd)
-        _print_report(no_rtd)
-        _print_comparison(with_rtd, no_rtd)
+        report = _compute_report(spot)
+        _print_report(report)
     except Exception as e:
         logger.exception(f"[FATAL ERROR] {e}")
     finally:

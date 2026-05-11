@@ -21,6 +21,8 @@ BOVA11 — B3 Brazilian options via COTAHIST + OI proxy
 pip install numpy pandas scipy matplotlib requests MetaTrader5
 ```
 
+If `daily_bova11_gex_report.py` exits with a missing dependency error, install the full set above.
+
 | Package | Purpose |
 |---|---|
 | `numpy` | Array operations, Greeks computation |
@@ -36,6 +38,12 @@ pip install numpy pandas scipy matplotlib requests MetaTrader5
 2. In MT5, go to **Tools → Options → Expert Advisors** and enable **Allow Algo Trading**.
 3. Place this project folder under your MT5 `Scripts` directory (e.g. `MQL5/Scripts/GEX_Analytics_options_futures`).
 4. Run from a terminal or from within MT5's integrated Python environment.
+
+### Daily report (quick run)
+
+```
+python daily_bova11_gex_report.py
+```
 
 ## Project structure
 

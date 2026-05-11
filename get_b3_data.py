@@ -690,27 +690,12 @@ def fetch_open_interest(
     tickers: list = None,
 ) -> pd.DataFrame:
     """
-    Get the best available OI data. Priority:
-      0. Profit Pro RTD (COM live stream, or CSV export)
-      1. External CSV file (user-provided real OI)
-      2. Multi-day COTAHIST volume accumulation (OI proxy)
+        Get the best available OI data. Priority:
+            1. External CSV file (user-provided real OI)
+            2. Multi-day COTAHIST volume accumulation (OI proxy)
 
     Returns DataFrame with columns: ticker, oi
     """
-    # Priority 0: Profit Pro RTD (COM first, then CSV fallback)
-    try:
-        from rtd_oi_reader import read_rtd_oi, RTD_OI_PATH
-        rtd = read_rtd_oi(spot=spot, tickers=tickers)
-        if not rtd.empty:
-            mode = 'COM' if tickers else 'CSV'
-            print(f"   [OK] RTD OI loaded ({mode}): {len(rtd)} records")
-            rtd['oi_source'] = 'rtd_profit_pro'
-            return rtd[['ticker', 'oi', 'oi_source']]
-    except ImportError:
-        pass
-    except Exception as e:
-        print(f"   [!] RTD OI read error: {e}")
-
     # Priority 1: External OI file
     if oi_csv_path:
         oi = load_external_oi(oi_csv_path)
