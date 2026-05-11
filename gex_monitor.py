@@ -112,6 +112,129 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                 return new_symbol, current_mapper
         return current_symbol, current_mapper
 
+    async def _run_gex_refresh(tag, spot, include_entries=False, spot_unavailable_msg=None,
+                               update_tp=True, put_wall_na_label="  Put Wall  : N/A"):
+        """Recalculate GEX levels and update in-scope state with consistent logging."""
+        nonlocal call_wall, put_wall, gamma_flip
+        nonlocal support_zones, resist_zones, pin_candidates
+        nonlocal entry_buy_bova, entry_sell_bova, win_entry_buy, win_entry_sell
+        nonlocal win_tp_buy, win_tp_sell
+
+        if spot <= 0:
+            if spot_unavailable_msg:
+                ts_now = _dt.now().strftime("%H:%M:%S")
+                print(f"[{ts_now}] [{tag}] {spot_unavailable_msg}")
+            return
+
+        result = await analyze_options(
+            spot, "BOVA11",
+            win_mapper=win_mapper,
+            win_symbol=win_symbol,
+            mt5_conn=mt5_conn,
+        )
+        if result is None:
+            ts_now = _dt.now().strftime("%H:%M:%S")
+            print(f"[{ts_now}] [{tag}] Reanalysis returned nothing — keeping old levels")
+            return
+
+        old_cw, old_pw, old_gf = call_wall, put_wall, gamma_flip
+        call_wall = result['call_wall']
+        put_wall = result['put_wall']
+        gamma_flip = result['gamma_flip']
+
+        support_zones = result.get('support_zones', pd.DataFrame())
+        resist_zones = result.get('resist_zones', pd.DataFrame())
+        pin_candidates = result.get('pin_candidates', pd.DataFrame())
+
+        entry_buy_bova, entry_sell_bova = nearest_support_resistance(
+            spot, support_zones, resist_zones,
+            put_wall=put_wall, call_wall=call_wall, pin_candidates=pin_candidates,
+        )
+        entry_buy_bova = apply_proximity_offset(entry_buy_bova, 'buy')
+        entry_sell_bova = apply_proximity_offset(entry_sell_bova, 'sell')
+        win_entry_buy = win_mapper.bova11_to_ind(entry_buy_bova) if np.isfinite(entry_buy_bova) else np.nan
+        win_entry_sell = win_mapper.bova11_to_ind(entry_sell_bova) if np.isfinite(entry_sell_bova) else np.nan
+        if update_tp:
+            win_tp_buy = win_mapper.bova11_to_ind(call_wall) if np.isfinite(call_wall) else np.nan
+            win_tp_sell = win_mapper.bova11_to_ind(put_wall) if np.isfinite(put_wall) else np.nan
+
+        ts_now = _dt.now().strftime("%H:%M:%S")
+        print(f"[{ts_now}] [{tag}] GEX REFRESHED")
+        print(f"  Call Wall : {old_cw:.2f} → {call_wall:.2f}" if np.isfinite(call_wall) else f"  Call Wall : N/A")
+        print(f"  Put Wall  : {old_pw:.2f} → {put_wall:.2f}" if np.isfinite(put_wall) else put_wall_na_label)
+        print(f"  Gamma Flip: {old_gf:.2f} → {gamma_flip:.2f}" if np.isfinite(gamma_flip) else f"  Gamma Flip: N/A")
+        if include_entries:
+            print(f"  Entry BUY : {entry_buy_bova:.2f} → {win_entry_buy:.0f} (WIN)" if np.isfinite(entry_buy_bova) else f"  Entry BUY : N/A")
+            print(f"  Entry SELL: {entry_sell_bova:.2f} → {win_entry_sell:.0f} (WIN)" if np.isfinite(entry_sell_bova) else f"  Entry SELL: N/A")
+
+    def _calc_order_volume(margin_1, fib_total, margin_budget, default_volume):
+        if margin_1 is not None and margin_1 > 0 and margin_budget > 0:
+            vol = int(margin_budget / (margin_1 * fib_total))
+            vol = max(vol, int(default_volume))
+            total_margin = margin_1 * vol * fib_total
+        else:
+            vol = int(default_volume)
+            total_margin = margin_1 if margin_1 else 0.0
+        return vol, total_margin
+
+    def _calc_sl_price(is_buy, entry_price, tick_sz, vol, tick_val, margin_budget):
+        risk_r = margin_budget * GEX_SL_RISK_PCT
+        sl_points = (risk_r / vol) / (tick_val / tick_sz) if vol > 0 and tick_val > 0 else 0.0
+        sl_points = round(sl_points / tick_sz) * tick_sz
+        sl_points = max(sl_points, GEX_MIN_SL_POINTS)
+        if is_buy:
+            sl_price = round(round((entry_price - sl_points) / tick_sz) * tick_sz, 0) if sl_points > 0 else 0.0
+        else:
+            sl_price = round(round((entry_price + sl_points) / tick_sz) * tick_sz, 0) if sl_points > 0 else 0.0
+        return sl_points, sl_price, risk_r
+
+    def _build_trail(entry_price, vol, tick_sz, tick_val, sl_points, sl_price, entry_budget, wall_label):
+        return {
+            'entry': entry_price, 'vol': vol,
+            'best': entry_price, 'active': False,
+            'tick_sz': tick_sz, 'tick_val': tick_val,
+            'sl_points': sl_points, 'sl_price': sl_price,
+            'dca_count': 0, 'wall': wall_label,
+            'margin_budget': entry_budget,
+        }
+
+    def _log_first_dca(is_buy, entry_price, tick_sz, pnl_pt, dca_step):
+        if pnl_pt <= 0:
+            return
+        if is_buy:
+            dca_price = entry_price - (dca_step / pnl_pt)
+        else:
+            dca_price = entry_price + (dca_step / pnl_pt)
+        dca_price = round(round(dca_price / tick_sz) * tick_sz, 0)
+        print(f"       [DCA] 1st DCA triggers at {dca_price:.0f} "
+              f"(R${dca_step:,.2f} loss, {GEX_DCA_LOSS_STEP_PCT:.0%} of budget)")
+
+    def _compute_signal_state(bova_spot, buy_confirm_ticks, sell_confirm_ticks):
+        signal = generate_gex_trade_signals(
+            bova_spot, gamma_flip, call_wall, put_wall,
+            support_zones=support_zones if not support_zones.empty else None,
+            resist_zones=resist_zones if not resist_zones.empty else None,
+        )
+        sig = signal['signal']
+        strength = signal['strength']
+
+        buy_candidate = (sig == 'BUY' and strength >= GEX_MIN_SIGNAL_STRENGTH)
+        sell_candidate = (sig == 'SELL' and strength >= GEX_MIN_SIGNAL_STRENGTH)
+
+        buy_confirm_ticks = buy_confirm_ticks + 1 if buy_candidate else 0
+        sell_confirm_ticks = sell_confirm_ticks + 1 if sell_candidate else 0
+
+        buy_confirm_ok = (not GEX_REQUIRE_5M_CONFIRMATION) or (buy_confirm_ticks >= _confirm_ticks)
+        sell_confirm_ok = (not GEX_REQUIRE_5M_CONFIRMATION) or (sell_confirm_ticks >= _confirm_ticks)
+
+        _needs_neutral = GEX_NEUTRAL_ONLY and signal_requires_neutral_filter(signal)
+        neutral_ok = (not _needs_neutral) or is_neutral_setup(
+            bova_spot, gamma_flip, call_wall, put_wall, GEX_NEUTRAL_MAX_FLIP_DISTANCE_PCT
+        )
+
+        return (signal, sig, strength, buy_confirm_ticks, sell_confirm_ticks,
+                buy_confirm_ok, sell_confirm_ok, neutral_ok)
+
     if support_zones is None:
         support_zones = pd.DataFrame()
     if resist_zones is None:
@@ -257,43 +380,14 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
 
                     sym_info = _mt5.symbol_info("BOVA11")
                     _pt_spot = (sym_info.bid + sym_info.ask) / 2.0 if sym_info else 0.0
-                    if _pt_spot > 0:
-                        _pt_result = await analyze_options(
-                            _pt_spot, "BOVA11",
-                            win_mapper=win_mapper,
-                            win_symbol=win_symbol,
-                            mt5_conn=mt5_conn,
-                        )
-                        if _pt_result is not None:
-                            old_cw, old_pw, old_gf = call_wall, put_wall, gamma_flip
-                            call_wall = _pt_result['call_wall']
-                            put_wall = _pt_result['put_wall']
-                            gamma_flip = _pt_result['gamma_flip']
-
-                            support_zones = _pt_result.get('support_zones', pd.DataFrame())
-                            resist_zones = _pt_result.get('resist_zones', pd.DataFrame())
-                            pin_candidates = _pt_result.get('pin_candidates', pd.DataFrame())
-                            entry_buy_bova, entry_sell_bova = nearest_support_resistance(
-                                _pt_spot, support_zones, resist_zones,
-                                put_wall=put_wall, call_wall=call_wall, pin_candidates=pin_candidates,
-                            )
-                            entry_buy_bova = apply_proximity_offset(entry_buy_bova, 'buy')
-                            entry_sell_bova = apply_proximity_offset(entry_sell_bova, 'sell')
-                            win_entry_buy = win_mapper.bova11_to_ind(entry_buy_bova) if np.isfinite(entry_buy_bova) else np.nan
-                            win_entry_sell = win_mapper.bova11_to_ind(entry_sell_bova) if np.isfinite(entry_sell_bova) else np.nan
-                            win_tp_buy = win_mapper.bova11_to_ind(call_wall) if np.isfinite(call_wall) else np.nan
-                            win_tp_sell = win_mapper.bova11_to_ind(put_wall) if np.isfinite(put_wall) else np.nan
-
-                            print(f"[{ts_now}] [PRE-TRADE] GEX REFRESHED")
-                            print(f"  Call Wall : {old_cw:.2f} → {call_wall:.2f}" if np.isfinite(call_wall) else f"  Call Wall : N/A")
-                            print(f"  Put Wall  : {old_pw:.2f} → {put_wall:.2f}" if np.isfinite(put_wall) else f"  Put Wall  : N/A")
-                            print(f"  Gamma Flip: {old_gf:.2f} → {gamma_flip:.2f}" if np.isfinite(gamma_flip) else f"  Gamma Flip: N/A")
-                            print(f"  Entry BUY : {entry_buy_bova:.2f} → {win_entry_buy:.0f} (WIN)" if np.isfinite(entry_buy_bova) else f"  Entry BUY : N/A")
-                            print(f"  Entry SELL: {entry_sell_bova:.2f} → {win_entry_sell:.0f} (WIN)" if np.isfinite(entry_sell_bova) else f"  Entry SELL: N/A")
-                        else:
-                            print(f"[{ts_now}] [PRE-TRADE] Reanalysis returned nothing — keeping old levels")
-                    else:
-                        print(f"[{ts_now}] [PRE-TRADE] BOVA11 spot unavailable — keeping old levels")
+                    await _run_gex_refresh(
+                        "PRE-TRADE",
+                        _pt_spot,
+                        include_entries=True,
+                        spot_unavailable_msg="BOVA11 spot unavailable — keeping old levels",
+                        update_tp=True,
+                        put_wall_na_label="  Put Wall : N/A",
+                    )
                 except Exception as e:
                     ts_now = _dt.now().strftime("%H:%M:%S")
                     print(f"[{ts_now}] [PRE-TRADE] Refresh failed: {e} — keeping old levels")
@@ -311,37 +405,12 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
 
                             sym_info = _mt5.symbol_info("BOVA11")
                             rtd_spot = (sym_info.bid + sym_info.ask) / 2.0 if sym_info else 0.0
-                            if rtd_spot > 0:
-                                rtd_result = await analyze_options(
-                                    rtd_spot, "BOVA11",
-                                    win_mapper=win_mapper,
-                                    win_symbol=win_symbol,
-                                    mt5_conn=mt5_conn,
-                                )
-                                if rtd_result is not None:
-                                    old_cw, old_pw, old_gf = call_wall, put_wall, gamma_flip
-                                    call_wall = rtd_result['call_wall']
-                                    put_wall = rtd_result['put_wall']
-                                    gamma_flip = rtd_result['gamma_flip']
-
-                                    support_zones = rtd_result.get('support_zones', pd.DataFrame())
-                                    resist_zones = rtd_result.get('resist_zones', pd.DataFrame())
-                                    pin_candidates = rtd_result.get('pin_candidates', pd.DataFrame())
-                                    entry_buy_bova, entry_sell_bova = nearest_support_resistance(
-                                        rtd_spot, support_zones, resist_zones,
-                                        put_wall=put_wall, call_wall=call_wall, pin_candidates=pin_candidates,
-                                    )
-                                    entry_buy_bova = apply_proximity_offset(entry_buy_bova, 'buy')
-                                    entry_sell_bova = apply_proximity_offset(entry_sell_bova, 'sell')
-                                    win_entry_buy = win_mapper.bova11_to_ind(entry_buy_bova) if np.isfinite(entry_buy_bova) else np.nan
-                                    win_entry_sell = win_mapper.bova11_to_ind(entry_sell_bova) if np.isfinite(entry_sell_bova) else np.nan
-
-                                    print(f"[{ts_now}] [RTD] GEX REFRESHED")
-                                    print(f"  Call Wall : {old_cw:.2f} → {call_wall:.2f}" if np.isfinite(call_wall) else f"  Call Wall : N/A")
-                                    print(f"  Put Wall  : {old_pw:.2f} → {put_wall:.2f}" if np.isfinite(put_wall) else f"  Put Wall  : N/A")
-                                    print(f"  Gamma Flip: {old_gf:.2f} → {gamma_flip:.2f}" if np.isfinite(gamma_flip) else f"  Gamma Flip: N/A")
-                                else:
-                                    print(f"[{ts_now}] [RTD] Reanalysis returned nothing — keeping old levels")
+                            await _run_gex_refresh(
+                                "RTD",
+                                rtd_spot,
+                                include_entries=False,
+                                update_tp=False,
+                            )
                         except Exception as e:
                             ts_now = _dt.now().strftime("%H:%M:%S")
                             print(f"[{ts_now}] [RTD] Refresh failed: {e} — keeping old levels")
@@ -373,28 +442,11 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
             win_spot = (tick.bid + tick.ask) / 2.0
             bova_spot = win_mapper.ind_to_bova11(win_spot)
 
-            signal = generate_gex_trade_signals(bova_spot, gamma_flip, call_wall, put_wall,
-                                                  support_zones=support_zones if not support_zones.empty else None,
-                                                  resist_zones=resist_zones if not resist_zones.empty else None)
-            sig = signal['signal']
-            strength = signal['strength']
-            tick_count += 1
-
-            buy_candidate = (sig == 'BUY' and strength >= GEX_MIN_SIGNAL_STRENGTH)
-            sell_candidate = (sig == 'SELL' and strength >= GEX_MIN_SIGNAL_STRENGTH)
-
-            buy_confirm_ticks = buy_confirm_ticks + 1 if buy_candidate else 0
-            sell_confirm_ticks = sell_confirm_ticks + 1 if sell_candidate else 0
-
-            buy_confirm_ok = (not GEX_REQUIRE_5M_CONFIRMATION) or (buy_confirm_ticks >= _confirm_ticks)
-            sell_confirm_ok = (not GEX_REQUIRE_5M_CONFIRMATION) or (sell_confirm_ticks >= _confirm_ticks)
-            # Only apply the neutral-setup filter to gamma-flip proximity trades
-            # (buy_setup_near_gamma_flip). Regular regime signals (negative/positive
-            # gamma bounces) must not be blocked by this filter.
-            _needs_neutral = GEX_NEUTRAL_ONLY and signal_requires_neutral_filter(signal)
-            neutral_ok = (not _needs_neutral) or is_neutral_setup(
-                bova_spot, gamma_flip, call_wall, put_wall, GEX_NEUTRAL_MAX_FLIP_DISTANCE_PCT
+            (signal, sig, strength, buy_confirm_ticks, sell_confirm_ticks,
+             buy_confirm_ok, sell_confirm_ok, neutral_ok) = _compute_signal_state(
+                 bova_spot, buy_confirm_ticks, sell_confirm_ticks
             )
+            tick_count += 1
 
             ts = _dt.now().strftime("%H:%M:%S")
             side_status = (("BUY:DONE" if buy_executed else "BUY:wait") + " | "
@@ -512,21 +564,15 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                 if not buy_executed:
                     margin_1 = _mt5.order_calc_margin(
                         _mt5.ORDER_TYPE_BUY, win_symbol, 1.0, tick.ask)
-                    if margin_1 is not None and margin_1 > 0 and margin_budget > 0:
-                        vol = int(margin_budget / (margin_1 * _fib_total))
-                        vol = max(vol, int(GEX_ORDER_VOLUME))
-                        total_margin = margin_1 * vol * _fib_total
-                    else:
-                        vol = int(GEX_ORDER_VOLUME)
-                        total_margin = margin_1 if margin_1 else 0.0
+                    vol, total_margin = _calc_order_volume(
+                        margin_1, _fib_total, margin_budget, GEX_ORDER_VOLUME
+                    )
                     sym_info = _mt5.symbol_info(win_symbol)
                     tick_val = sym_info.trade_tick_value if sym_info else 1.0
                     tick_sz  = sym_info.trade_tick_size if sym_info else 5.0
-                    risk_r = margin_budget * GEX_SL_RISK_PCT
-                    sl_points = (risk_r / vol) / (tick_val / tick_sz) if vol > 0 and tick_val > 0 else 0.0
-                    sl_points = round(sl_points / tick_sz) * tick_sz
-                    sl_points = max(sl_points, GEX_MIN_SL_POINTS)
-                    sl_price = round(round((tick.ask - sl_points) / tick_sz) * tick_sz, 0) if sl_points > 0 else 0.0
+                    sl_points, sl_price, risk_r = _calc_sl_price(
+                        True, tick.ask, tick_sz, vol, tick_val, margin_budget
+                    )
                     tp_price = round(round(win_tp_buy / tick_sz) * tick_sz, 0) if GEX_TP_AT_OPPOSITE_WALL and np.isfinite(win_tp_buy) else 0.0
                     print(f"\n[GEX Monitor] *** BUY TRIGGERED @ {tick.ask:.0f} | {vol} contracts "
                           f"(budget R${margin_budget:,.2f} [{GEX_MARGIN_FREE_PCT:.1%} free], margin R${total_margin:,.2f}, "
@@ -546,25 +592,17 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                     if result is not None and hasattr(result, 'retcode') and result.retcode == _mt5.TRADE_RETCODE_DONE:
                         buy_executed = True
                         _buy_retry_after = 0.0
-                        trail_buy = {
-                            'entry': tick.ask, 'vol': vol,
-                            'best': tick.ask, 'active': False,
-                            'tick_sz': tick_sz, 'tick_val': tick_val,
-                            'sl_points': sl_points, 'sl_price': sl_price,
-                            'dca_count': 0, 'wall': 'PutWall',
-                            'margin_budget': _entry_budget,
-                        }
+                        trail_buy = _build_trail(
+                            tick.ask, vol, tick_sz, tick_val,
+                            sl_points, sl_price, _entry_budget, 'PutWall'
+                        )
                         _trail_activation = _entry_budget * GEX_TRAILING_ACTIVATION_PCT
                         print(f"[GEX Monitor] BUY FILLED — {vol} contracts, order #{result.order}")
                         print(f"       [Trailing] activates at R${_trail_activation:,.2f} profit "
                               f"({GEX_TRAILING_ACTIVATION_PCT:.0%} of R${_entry_budget:,.2f} budget)")
                         _dca1_step = margin_budget * GEX_DCA_LOSS_STEP_PCT
                         _pnl_pt = vol * (tick_val / tick_sz) if tick_sz > 0 else 0
-                        if _pnl_pt > 0:
-                            _dca1_price = tick.ask - (_dca1_step / _pnl_pt)
-                            _dca1_price = round(round(_dca1_price / tick_sz) * tick_sz, 0)
-                            print(f"       [DCA] 1st DCA triggers at {_dca1_price:.0f} "
-                                  f"(R${_dca1_step:,.2f} loss, {GEX_DCA_LOSS_STEP_PCT:.0%} of budget)")
+                        _log_first_dca(True, tick.ask, tick_sz, _pnl_pt, _dca1_step)
                         print()
                     else:
                         # Order did NOT fill. Do NOT mark buy_executed so the
@@ -591,21 +629,15 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                 if not sell_executed:
                     margin_1 = _mt5.order_calc_margin(
                         _mt5.ORDER_TYPE_SELL, win_symbol, 1.0, tick.bid)
-                    if margin_1 is not None and margin_1 > 0 and margin_budget > 0:
-                        vol = int(margin_budget / (margin_1 * _fib_total))
-                        vol = max(vol, int(GEX_ORDER_VOLUME))
-                        total_margin = margin_1 * vol * _fib_total
-                    else:
-                        vol = int(GEX_ORDER_VOLUME)
-                        total_margin = margin_1 if margin_1 else 0.0
+                    vol, total_margin = _calc_order_volume(
+                        margin_1, _fib_total, margin_budget, GEX_ORDER_VOLUME
+                    )
                     sym_info = _mt5.symbol_info(win_symbol)
                     tick_val = sym_info.trade_tick_value if sym_info else 1.0
                     tick_sz  = sym_info.trade_tick_size if sym_info else 5.0
-                    risk_r = margin_budget * GEX_SL_RISK_PCT
-                    sl_points = (risk_r / vol) / (tick_val / tick_sz) if vol > 0 and tick_val > 0 else 0.0
-                    sl_points = round(sl_points / tick_sz) * tick_sz
-                    sl_points = max(sl_points, GEX_MIN_SL_POINTS)
-                    sl_price = round(round((tick.bid + sl_points) / tick_sz) * tick_sz, 0) if sl_points > 0 else 0.0
+                    sl_points, sl_price, risk_r = _calc_sl_price(
+                        False, tick.bid, tick_sz, vol, tick_val, margin_budget
+                    )
                     tp_price = round(round(win_tp_sell / tick_sz) * tick_sz, 0) if GEX_TP_AT_OPPOSITE_WALL and np.isfinite(win_tp_sell) else 0.0
                     print(f"\n[GEX Monitor] *** SELL TRIGGERED @ {tick.bid:.0f} | {vol} contracts "
                           f"(budget R${margin_budget:,.2f} [{GEX_MARGIN_FREE_PCT:.1%} free], margin R${total_margin:,.2f}, "
@@ -625,25 +657,17 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                     if result is not None and hasattr(result, 'retcode') and result.retcode == _mt5.TRADE_RETCODE_DONE:
                         sell_executed = True
                         _sell_retry_after = 0.0
-                        trail_sell = {
-                            'entry': tick.bid, 'vol': vol,
-                            'best': tick.bid, 'active': False,
-                            'tick_sz': tick_sz, 'tick_val': tick_val,
-                            'sl_points': sl_points, 'sl_price': sl_price,
-                            'dca_count': 0, 'wall': 'CallWall',
-                            'margin_budget': _entry_budget,
-                        }
+                        trail_sell = _build_trail(
+                            tick.bid, vol, tick_sz, tick_val,
+                            sl_points, sl_price, _entry_budget, 'CallWall'
+                        )
                         _trail_activation = _entry_budget * GEX_TRAILING_ACTIVATION_PCT
                         print(f"[GEX Monitor] SELL FILLED — {vol} contracts, order #{result.order}")
                         print(f"       [Trailing] activates at R${_trail_activation:,.2f} profit "
                               f"({GEX_TRAILING_ACTIVATION_PCT:.0%} of R${_entry_budget:,.2f} budget)")
                         _dca1_step = margin_budget * GEX_DCA_LOSS_STEP_PCT
                         _pnl_pt = vol * (tick_val / tick_sz) if tick_sz > 0 else 0
-                        if _pnl_pt > 0:
-                            _dca1_price = tick.bid + (_dca1_step / _pnl_pt)
-                            _dca1_price = round(round(_dca1_price / tick_sz) * tick_sz, 0)
-                            print(f"       [DCA] 1st DCA triggers at {_dca1_price:.0f} "
-                                  f"(R${_dca1_step:,.2f} loss, {GEX_DCA_LOSS_STEP_PCT:.0%} of budget)")
+                        _log_first_dca(False, tick.bid, tick_sz, _pnl_pt, _dca1_step)
                         print()
                     else:
                         # Order did NOT fill. Keep sell_executed False so the
