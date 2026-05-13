@@ -162,13 +162,25 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
             print(f"  Entry BUY : {entry_buy_bova:.2f} → {win_entry_buy:.0f} (WIN)" if np.isfinite(entry_buy_bova) else f"  Entry BUY : N/A")
             print(f"  Entry SELL: {entry_sell_bova:.2f} → {win_entry_sell:.0f} (WIN)" if np.isfinite(entry_sell_bova) else f"  Entry SELL: N/A")
 
-    def _calc_order_volume(margin_1, fib_total, margin_budget, default_volume):
+    def _calc_order_volume(margin_1, fib_total, margin_budget, default_volume,
+                             vol_min=1.0, vol_step=1.0):
+        """Compute order volume snapped to vol_step and clamped to vol_min.
+
+        Using int() would truncate 0.5 to 0 for fractional defaults (e.g.
+        CONSERVATIVE profile), producing an invalid volume (retcode 10014).
+        """
+        def _snap(v):
+            if vol_step <= 0:
+                return max(v, vol_min)
+            snapped = math.ceil(v / vol_step) * vol_step
+            return max(snapped, vol_min)
+
         if margin_1 is not None and margin_1 > 0 and margin_budget > 0:
-            vol = int(margin_budget / (margin_1 * fib_total))
-            vol = max(vol, int(default_volume))
+            raw_vol = margin_budget / (margin_1 * fib_total)
+            vol = max(_snap(raw_vol), _snap(default_volume))
             total_margin = margin_1 * vol * fib_total
         else:
-            vol = int(default_volume)
+            vol = _snap(default_volume)
             total_margin = margin_1 if margin_1 else 0.0
         return vol, total_margin
 
@@ -530,14 +542,17 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                     buy_executed = True
                     print(f"[GEX Monitor] BUY position already open for magic {GEX_MAGIC_NUMBER} — skipped")
                 if not buy_executed:
+                    sym_info = _mt5.symbol_info(win_symbol)
+                    tick_val  = sym_info.trade_tick_value if sym_info else 1.0
+                    tick_sz   = sym_info.trade_tick_size if sym_info else 5.0
+                    _vol_min  = sym_info.volume_min if sym_info else 1.0
+                    _vol_step = sym_info.volume_step if sym_info else 1.0
                     margin_1 = _mt5.order_calc_margin(
                         _mt5.ORDER_TYPE_BUY, win_symbol, 1.0, tick.ask)
                     vol, total_margin = _calc_order_volume(
-                        margin_1, _fib_total, margin_budget, GEX_ORDER_VOLUME
+                        margin_1, _fib_total, margin_budget, GEX_ORDER_VOLUME,
+                        _vol_min, _vol_step
                     )
-                    sym_info = _mt5.symbol_info(win_symbol)
-                    tick_val = sym_info.trade_tick_value if sym_info else 1.0
-                    tick_sz  = sym_info.trade_tick_size if sym_info else 5.0
                     sl_points, sl_price, risk_r = _calc_sl_price(
                         True, tick.ask, tick_sz, vol, tick_val, margin_budget
                     )
@@ -595,14 +610,17 @@ async def monitor_gex_entries(mt5_conn, win_symbol, win_mapper,
                     sell_executed = True
                     print(f"[GEX Monitor] SELL position already open for magic {GEX_MAGIC_NUMBER} — skipped")
                 if not sell_executed:
+                    sym_info = _mt5.symbol_info(win_symbol)
+                    tick_val  = sym_info.trade_tick_value if sym_info else 1.0
+                    tick_sz   = sym_info.trade_tick_size if sym_info else 5.0
+                    _vol_min  = sym_info.volume_min if sym_info else 1.0
+                    _vol_step = sym_info.volume_step if sym_info else 1.0
                     margin_1 = _mt5.order_calc_margin(
                         _mt5.ORDER_TYPE_SELL, win_symbol, 1.0, tick.bid)
                     vol, total_margin = _calc_order_volume(
-                        margin_1, _fib_total, margin_budget, GEX_ORDER_VOLUME
+                        margin_1, _fib_total, margin_budget, GEX_ORDER_VOLUME,
+                        _vol_min, _vol_step
                     )
-                    sym_info = _mt5.symbol_info(win_symbol)
-                    tick_val = sym_info.trade_tick_value if sym_info else 1.0
-                    tick_sz  = sym_info.trade_tick_size if sym_info else 5.0
                     sl_points, sl_price, risk_r = _calc_sl_price(
                         False, tick.bid, tick_sz, vol, tick_val, margin_budget
                     )

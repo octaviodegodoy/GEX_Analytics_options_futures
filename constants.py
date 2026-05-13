@@ -26,7 +26,7 @@ GEX_NEUTRAL_MAX_FLIP_DISTANCE_PCT = 0.005  # Max distance to flip for neutral se
 
 # --- PROFILE: CONSERVATIVE (Low risk, smaller size, fewer DCA) ---
 _PROFILE_CONSERVATIVE = {
-    'order_volume': 0.5,            # Smaller initial size
+    'order_volume': 1.0,            # Minimum for WIN futures (integer lots only)
     'margin_free_pct': 0.02,        # Use only 2% of free margin as total budget
     'sl_risk_pct': 0.30,            # Stop loss as 30% of margin (tighter)
     'dca_max_orders': 1,            # Only 1 DCA addition (total = initial + 1)
