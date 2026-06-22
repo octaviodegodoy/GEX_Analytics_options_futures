@@ -408,7 +408,7 @@ def plot_gex_weekly(weekly_results, spot, underlying, show_plots=False,
 
     fig.suptitle(f"{underlying} — Weekly GEX Analysis", fontsize=14,
                  fontweight='bold', color='#F9FAFB', y=0.98)
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
     if show_plots:
         plt.show()
     plt.close(fig)

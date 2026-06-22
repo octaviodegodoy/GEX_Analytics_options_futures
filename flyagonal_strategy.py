@@ -414,3 +414,45 @@ def format_flyagonal_snapshot(result, win_mapper=None):
     lines.append("=" * 75)
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Best-candidate selector
+# ---------------------------------------------------------------------------
+
+def select_best_flyagonal(candidates):
+    """
+    Select the best flyagonal from a list of build_flyagonal() results.
+
+    Ranking priority:
+      1. Suitability: IDEAL beats SUBOPTIMAL.
+      2. Reward/risk ratio: max_profit / abs(max_loss).
+      3. Tie-break: net credit (net_premium > 0) preferred over debit.
+
+    Parameters
+    ----------
+    candidates : list[dict | None]
+        Results from build_flyagonal(). None entries are silently ignored.
+
+    Returns
+    -------
+    dict | None
+        Highest-scoring result, or None if all candidates are None/invalid.
+    """
+    valid = [c for c in candidates if c is not None]
+    if not valid:
+        return None
+    if len(valid) == 1:
+        return valid[0]
+
+    def _score(result):
+        suit = 1 if result.get('suitability') == 'IDEAL' else 0
+        mp = result.get('max_profit', np.nan)
+        ml = result.get('max_loss', np.nan)
+        rr = 0.0
+        if np.isfinite(mp) and np.isfinite(ml) and ml != 0:
+            rr = mp / abs(ml)
+        credit_bonus = 0.1 if result.get('net_premium', 0) > 0 else 0.0
+        return suit * 10 + rr + credit_bonus
+
+    return max(valid, key=_score)

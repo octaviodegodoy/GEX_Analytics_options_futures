@@ -14,7 +14,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 def export_gex_csv(underlying, spot, call_wall, put_wall, gamma_flip, regime,
                    weekly_results, pin_snapshot, resist_zones, support_zones,
                    win_mapper, trade_signal=None, flyagonal=None,
-                   win_symbol=""):
+                   strangle=None, win_symbol=""):
     """Write GEX levels to MQL5/Files/GEX_<underlying>.csv for the MT5 indicator."""
     mql5_root = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..'))
     files_dir = os.path.join(mql5_root, 'Files')
@@ -79,6 +79,14 @@ def export_gex_csv(underlying, spot, call_wall, put_wall, gamma_flip, regime,
         rows.append(("fly_upper", f"{flyagonal['upper_strike']:.4f}", _win(flyagonal['upper_strike']), flyagonal['far_expiry']))
         rows.append(("fly_net_premium", f"{flyagonal['net_premium']:.4f}", "", ""))
         rows.append(("fly_suitability", flyagonal['suitability'], "", ""))
+
+    # Strangle strategy levels
+    if strangle is not None:
+        rows.append(("strangle_call", f"{strangle['call_strike']:.4f}", _win(strangle['call_strike']), strangle['expiry']))
+        rows.append(("strangle_put", f"{strangle['put_strike']:.4f}", _win(strangle['put_strike']), strangle['expiry']))
+        rows.append(("strangle_direction", strangle['direction'], "", ""))
+        rows.append(("strangle_net_premium", f"{strangle['net_premium']:.4f}", "", ""))
+        rows.append(("strangle_suitability", strangle['suitability'], "", ""))
 
     # Entry lines — closest support / resistance to spot with directional offset
     _pin_df = pin_snapshot.get('pin_candidates', pd.DataFrame()) if pin_snapshot is not None else pd.DataFrame()

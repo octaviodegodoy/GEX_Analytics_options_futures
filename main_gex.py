@@ -50,7 +50,8 @@ from gex_utils import find_gamma_flip, compute_weekly_walls, generate_gex_trade_
 from gex_plots import plot_gex_weekly
 from b3_options_loader import load_b3_options_data
 
-from flyagonal_strategy import build_flyagonal, format_flyagonal_snapshot
+from flyagonal_strategy import build_flyagonal, format_flyagonal_snapshot, select_best_flyagonal
+from strangle_strategy import build_strangle, format_strangle_snapshot
 from mt5_connector import MT5Connector
 from di1_rate_curve import build_di1_curve
 from kalman_price_mapper import build_ind_bova11_mapper, build_ind_bova11_mapper_intraday
@@ -457,12 +458,24 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
 
     # ----------------------------------------------------------------
     # FLYAGONAL STRATEGY — Diagonal Butterfly from GEX levels
+    # Build both call and put variants; best one shown at end of scan.
     # ----------------------------------------------------------------
-    flyagonal = build_flyagonal(
+    _fly_call = build_flyagonal(
         df, spot, weekly_results, pin_snapshot, regime,
         option_type='call',
     )
-    print("\n" + format_flyagonal_snapshot(flyagonal, win_mapper=win_mapper))
+    _fly_put = build_flyagonal(
+        df, spot, weekly_results, pin_snapshot, regime,
+        option_type='put',
+    )
+    flyagonal = select_best_flyagonal([_fly_call, _fly_put])
+
+    # ----------------------------------------------------------------
+    # STRANGLE STRATEGY — OTM call + put using GEX walls as strikes
+    # ----------------------------------------------------------------
+    strangle = build_strangle(
+        df, spot, weekly_results, call_wall, put_wall, regime,
+    )
 
     # ----------------------------------------------------------------
     # Export CSV for MQL5 indicator → MQL5/Files/GEX_<underlying>.csv
@@ -473,6 +486,7 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
         win_mapper,
         trade_signal=trade_signal,
         flyagonal=flyagonal,
+        strangle=strangle,
         win_symbol=win_symbol,
     )
 
@@ -486,6 +500,22 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
             show_plots=True,
         )
 
+    # ----------------------------------------------------------------
+    # BEST FLYAGONAL SETUP — end-of-scan summary
+    # ----------------------------------------------------------------
+    print(f"\n{'='*75}")
+    print(f"BEST FLYAGONAL SETUP -- END OF SCAN")
+    print(f"{'='*75}")
+    print(format_flyagonal_snapshot(flyagonal, win_mapper=win_mapper))
+
+    # ----------------------------------------------------------------
+    # STRANGLE SETUP — end-of-scan summary
+    # ----------------------------------------------------------------
+    print(f"\n{'='*75}")
+    print(f"STRANGLE SETUP -- END OF SCAN")
+    print(f"{'='*75}")
+    print(format_strangle_snapshot(strangle, win_mapper=win_mapper))
+
     return {
         'call_wall': call_wall,
         'put_wall': put_wall,
@@ -495,6 +525,7 @@ async def analyze_options(spot: float, underlying: str = "PETR4", win_mapper=Non
         'support_zones': support_zones,
         'resist_zones': resist_zones,
         'pin_candidates': pin_snapshot.get('pin_candidates', pd.DataFrame()),
+        'strangle': strangle,
     }
 
 
@@ -615,20 +646,30 @@ async def main():
             continue
         spot_price = (symbol_info.bid + symbol_info.ask) / 2
         if spot_price <= 0:
-            print(f"[X] Spot price for {asset} is {spot_price:.2f} (bid={symbol_info.bid}, ask={symbol_info.ask}) -- skipping.")
-            continue
+            # Fallback: use last traded price (common at market open when bid/ask are 0)
+            last_price = float(getattr(symbol_info, 'last', 0.0) or 0.0)
+            if last_price > 0:
+                spot_price = last_price
+                print(f"[!] {asset}: bid/ask are 0 — using last traded price {spot_price:.2f}")
+            else:
+                print(f"[X] Spot price for {asset} is {spot_price:.2f} (bid={symbol_info.bid}, ask={symbol_info.ask}, last={last_price:.2f}) -- skipping.")
+                continue
         print(f"Analyzing options data for {asset} with spot price {spot_price:.2f}...")
         mapper_for_asset = win_mapper if asset == "BOVA11" else None
         win_sym_for_asset = win_symbol if asset == "BOVA11" else ""
         print(f"[DEBUG] Calling analyze_options for {asset} with spot {spot_price}")
-        result = await analyze_options(
-            spot_price,
-            asset,
-            win_mapper=mapper_for_asset,
-            win_symbol=win_sym_for_asset,
-            mt5_conn=mt5_conn,
-        )
-        print(f"[DEBUG] analyze_options finished for {asset}")
+        try:
+            result = await analyze_options(
+                spot_price,
+                asset,
+                win_mapper=mapper_for_asset,
+                win_symbol=win_sym_for_asset,
+                mt5_conn=mt5_conn,
+            )
+        except Exception as _exc:
+            print(f"[X] analyze_options raised an exception for {asset}: {_exc}")
+            result = None
+        print(f"[DEBUG] analyze_options finished for {asset}, result={'dict' if result is not None else 'None'}")
         if asset == "BOVA11" and result is not None:
             bova11_gex = result
             if _prioritize_live_monitor:
@@ -661,7 +702,10 @@ async def main():
         if not _is_win_symbol:
             reasons.append("WIN symbol not resolved/invalid (monitor restricted to WIN contracts)")
         if bova11_gex is None:
-            reasons.append("BOVA11 analysis failed or not in ASSET_SYMBOL")
+            if _is_bova11_scope:
+                reasons.append("BOVA11 analysis returned None (spot price was 0, or B3 data unavailable, or exception in analyze_options)")
+            else:
+                reasons.append("BOVA11 not in ASSET_SYMBOL")
         if win_mapper is None:
             reasons.append("WIN-BOVA11 mapper unavailable")
         if not win_symbol:
